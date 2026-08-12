@@ -9,6 +9,7 @@ declare( strict_types = 1 );
 
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use WordPressdotorg\Plugin_Directory\Jobs\API_Update_Updater;
 use WordPressdotorg\Plugin_Directory\Jobs\Plugin_Scan_Gandalf;
 use WordPressdotorg\Plugin_Directory\Plugin_Directory;
 
@@ -52,6 +53,16 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 		// Tools::audit_log() reads it unguarded.
 		$_SERVER['REMOTE_ADDR'] = '127.0.0.1';
+		if ( ! get_user_by( 'slug', 'wordpressdotorg' ) ) {
+			$audit_user_id = wp_insert_user(
+				array(
+					'user_login' => 'wordpressdotorg',
+					'user_pass'  => wp_generate_password( 24 ),
+					'user_email' => 'wordpressdotorg@example.invalid',
+				)
+			);
+			$this->assertIsInt( $audit_user_id );
+		}
 
 		if ( ! defined( 'WP_GANDALF_SCAN_SHARED_SECRET' ) ) {
 			define( 'WP_GANDALF_SCAN_SHARED_SECRET', 'test-shared-secret' );
@@ -185,12 +196,27 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 	 * @return \WP_REST_Response The response.
 	 */
 	private function dispatch( array $payload, ?string $bearer = null, ?string $slug = null ): \WP_REST_Response {
+		$body = wp_json_encode( $payload );
+		$this->assertIsString( $body );
+
+		return $this->dispatch_raw( $body, $bearer, $slug );
+	}
+
+	/**
+	 * Dispatch an exact callback body through the REST server.
+	 *
+	 * @param string      $body   Exact callback body.
+	 * @param string|null $bearer The bearer token; null for the shared secret, '' to omit the header.
+	 * @param string|null $slug   The routed plugin slug; null for the fixture plugin.
+	 * @return \WP_REST_Response The response.
+	 */
+	private function dispatch_raw( string $body, ?string $bearer = null, ?string $slug = null ): \WP_REST_Response {
 		$slug   = $slug ?? $this->plugin->post_name;
 		$bearer = $bearer ?? WP_GANDALF_SCAN_SHARED_SECRET;
 
 		$request = new \WP_REST_Request( 'POST', "/plugins/v1/plugin/{$slug}/gandalf-scan" );
 		$request->set_header( 'Content-Type', 'application/json' );
-		$request->set_body( (string) wp_json_encode( $payload ) );
+		$request->set_body( $body );
 
 		if ( '' !== $bearer ) {
 			$request->set_header( 'Authorization', 'Bearer ' . $bearer );
@@ -205,10 +231,70 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 	public function test_callback_is_accepted(): void {
 		$response = $this->dispatch( $this->payload() );
 
-		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( 200, $response->get_status(), wp_json_encode( $response->get_data() ) );
 		$this->assertSame( array( 'success' => true ), $response->get_data() );
 
+		$snapshot = get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::LAST_RESULT_META_KEY, true );
+		$this->assertSame( 'advisory', $snapshot['action'] );
+		$this->assertSame( 5.5, $snapshot['max_risk_score'] );
+		$this->assertCount( 3, $snapshot['findings'] );
+
 		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+	}
+
+	/**
+	 * Replay identity is the exact received body, not equivalent decoded JSON.
+	 */
+	public function test_exact_body_replay_is_idempotent(): void {
+		$payload = $this->payload();
+		$body    = wp_json_encode( $payload );
+		$this->assertIsString( $body );
+
+		$this->assertSame( 200, $this->dispatch_raw( $body )->get_status() );
+		$this->assertSame( 200, $this->dispatch_raw( $body )->get_status() );
+
+		$reordered_body = wp_json_encode( array_reverse( $payload, true ) );
+		$this->assertIsString( $reordered_body );
+		$this->assertSame( 409, $this->dispatch_raw( $reordered_body )->get_status() );
+	}
+
+	/**
+	 * A high-risk callback blocks the release end to end.
+	 */
+	public function test_high_risk_callback_blocks_release(): void {
+		update_post_meta(
+			$this->plugin->ID,
+			'releases',
+			array(
+				array(
+					'date'                     => time(),
+					'tag'                      => self::VERSION,
+					'version'                  => self::VERSION,
+					'zips_built'               => true,
+					'zips_built_from_revision' => 0,
+					'confirmations'            => array(),
+					'confirmed'                => true,
+					'confirmations_required'   => 0,
+					'committer'                => array(),
+					'revision'                 => array(),
+					'release_delay'            => DAY_IN_SECONDS,
+				),
+			)
+		);
+
+		$payload                              = $this->payload();
+		$payload['findings'][0]['risk_score'] = 9.8;
+		$payload['max_risk_score']            = 9.8;
+
+		$response = $this->dispatch( $payload );
+
+		$this->assertSame( 200, $response->get_status() );
+
+		$release = Plugin_Directory::get_release( get_post( $this->plugin->ID ), self::VERSION );
+		$this->assertTrue( API_Update_Updater::is_release_blocked( $release ) );
+
+		$snapshot = get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::LAST_RESULT_META_KEY, true );
+		$this->assertSame( 'blocked', $snapshot['action'] );
 	}
 
 	/**
@@ -237,28 +323,69 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 		$last_error = get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::LAST_ERROR_META_KEY, true );
 		$this->assertSame( 'timeout', $last_error['kind'] );
+		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
 	}
 
 	/**
-	 * Contract additions the directory does not know yet — new fields at any
-	 * level, a new severity, a recalibrated score — do not void a delivery.
+	 * Unknown callback fields are rejected at every object boundary.
 	 */
-	public function test_unknown_contract_additions_are_accepted(): void {
-		$payload = $this->payload(
-			array(
-				'scan_duration'  => 314,
-				'max_risk_score' => 10.5,
-			)
+	public function test_unknown_contract_additions_are_rejected(): void {
+		$payloads = array();
+
+		$payload                  = $this->payload();
+		$payload['scan_duration'] = 314;
+		$payloads[]               = $payload;
+
+		$payload                                    = $this->payload();
+		$payload['findings'][0]['exploit_maturity'] = 'proof-of-concept';
+		$payloads[]                                 = $payload;
+
+		$payload = $this->payload();
+		$payload['findings'][0]['investigation']['effort'] = 'medium';
+		$payloads[]                                        = $payload;
+
+		foreach ( $payloads as $payload ) {
+			$response = $this->dispatch( $payload );
+
+			$this->assertSame( 400, $response->get_status() );
+			$this->assertSame( 'invalid_gandalf_scan_callback', $response->get_data()['code'] );
+			$this->assertPendingScanExists();
+		}
+	}
+
+	/**
+	 * A maximum score inconsistent with the findings cannot drive policy.
+	 */
+	public function test_inconsistent_maximum_risk_is_rejected(): void {
+		$response = $this->dispatch( $this->payload( array( 'max_risk_score' => 9.8 ) ) );
+
+		$this->assertSame( 400, $response->get_status() );
+		$this->assertSame( 'invalid_gandalf_scan_callback', $response->get_data()['code'] );
+		$this->assertPendingScanExists();
+	}
+
+	/**
+	 * Closed policy vocabularies and score bounds cannot expand implicitly.
+	 */
+	public function test_invalid_policy_values_are_rejected(): void {
+		$invalid_severity                            = $this->payload();
+		$invalid_severity['findings'][0]['severity'] = 'catastrophic';
+		$invalid_severity['severity_counts']         = array(
+			'catastrophic' => 1,
+			'warning'      => 2,
 		);
 
-		$payload['findings'][0]['severity']                = 'catastrophic';
-		$payload['findings'][0]['exploit_maturity']        = 'proof-of-concept';
-		$payload['findings'][0]['investigation']['effort'] = 'medium';
+		$invalid_score                              = $this->payload();
+		$invalid_score['findings'][0]['risk_score'] = 10.5;
+		$invalid_score['max_risk_score']            = 10.5;
 
-		$response = $this->dispatch( $payload );
+		foreach ( array( $invalid_severity, $invalid_score ) as $payload ) {
+			$response = $this->dispatch( $payload );
 
-		$this->assertSame( 200, $response->get_status() );
-		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+			$this->assertSame( 400, $response->get_status() );
+			$this->assertSame( 'invalid_gandalf_scan_callback', $response->get_data()['code'] );
+			$this->assertPendingScanExists();
+		}
 	}
 
 	/**
@@ -305,8 +432,8 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 		$response = $this->dispatch( $this->payload( array( 'max_risk_score' => 'critical' ) ) );
 
 		$this->assertSame( 400, $response->get_status() );
-		$this->assertSame( 'rest_invalid_param', $response->get_data()['code'] );
-		$this->assertPendingScanUntouched();
+		$this->assertSame( 'invalid_gandalf_scan_callback', $response->get_data()['code'] );
+		$this->assertPendingScanExists();
 	}
 
 	/**
@@ -314,12 +441,44 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 	 */
 	public function test_missing_required_field_is_rejected(): void {
 		$payload = $this->payload();
-		unset( $payload['scan_id'] );
+		unset( $payload['max_risk_score'] );
 
 		$response = $this->dispatch( $payload );
 
 		$this->assertSame( 400, $response->get_status() );
-		$this->assertPendingScanUntouched();
+		$this->assertSame( 'invalid_gandalf_scan_callback', $response->get_data()['code'] );
+		$this->assertPendingScanExists();
+	}
+
+	/**
+	 * JSON arrays and strings cannot stand in for the severity-count object.
+	 */
+	public function test_severity_counts_must_be_a_json_object(): void {
+		$clean = array(
+			'findings_count'  => 0,
+			'findings'        => array(),
+			'max_risk_score'  => 0,
+			'severity_counts' => array(),
+		);
+
+		$this->assertSame( 400, $this->dispatch( $this->payload( $clean ) )->get_status() );
+
+		$clean['severity_counts'] = '';
+		$this->assertSame( 400, $this->dispatch( $this->payload( $clean ) )->get_status() );
+
+		$clean['severity_counts'] = (object) array();
+		$this->assertSame( 200, $this->dispatch( $this->payload( $clean ) )->get_status() );
+	}
+
+	/**
+	 * Report URLs are deterministic: HTTPS, plus loopback HTTP for development.
+	 */
+	public function test_report_url_scheme_policy(): void {
+		$public_http = $this->payload( array( 'report_url' => 'http://gandalf.wordpress.org/admin/runs/' . self::SCAN_ID ) );
+		$this->assertSame( 400, $this->dispatch( $public_http )->get_status() );
+
+		$loopback_http = $this->payload( array( 'report_url' => 'http://127.0.0.1:3000/admin/runs/' . self::SCAN_ID ) );
+		$this->assertSame( 200, $this->dispatch( $loopback_http )->get_status() );
 	}
 
 	/**
@@ -336,8 +495,15 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 	 * Assert the pending scan was not consumed and no error was recorded.
 	 */
 	private function assertPendingScanUntouched(): void {
+		$this->assertPendingScanExists();
+		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::LAST_ERROR_META_KEY, true ) );
+	}
+
+	/**
+	 * Assert the pending scan has not been consumed.
+	 */
+	private function assertPendingScanExists(): void {
 		$pending = get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true );
 		$this->assertArrayHasKey( self::SCAN_ID, $pending );
-		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::LAST_ERROR_META_KEY, true ) );
 	}
 }

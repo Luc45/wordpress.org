@@ -22,8 +22,9 @@ class Plugin_Scan {
 	 * @param array    $changed_svn_tags The SVN tags that were changed.
 	 * @param int      $svn_revision     The SVN revision number.
 	 * @param array    $warnings         The import warnings.
+	 * @param string   $version          The imported plugin Version header.
 	 */
-	public static function wporg_plugins_imported( $plugin, $stable_tag, $old_stable_tag, $changed_svn_tags, $svn_revision, $warnings = [] ) {
+	public static function wporg_plugins_imported( $plugin, $stable_tag, $old_stable_tag, $changed_svn_tags, $svn_revision, $warnings, $version ) {
 		$to_scan = [];
 		foreach ( (array) $changed_svn_tags as $tag ) {
 			if (
@@ -45,6 +46,7 @@ class Plugin_Scan {
 		$to_scan[] = $stable_tag;
 
 		$to_scan = array_unique( $to_scan );
+		$served_release = API_Update_Updater::get_served_release_identity( $plugin->post_name );
 
 		self::queue(
 			$plugin->post_name,
@@ -55,6 +57,8 @@ class Plugin_Scan {
 				'changed_svn_tags' => array_values( array_map( 'strval', (array) $changed_svn_tags ) ),
 				'svn_revision'     => (int) $svn_revision,
 				'warnings'         => is_array( $warnings ) ? $warnings : [],
+				'version'          => $version,
+				'served_release'   => $served_release,
 			]
 		);
 	}
@@ -89,7 +93,7 @@ class Plugin_Scan {
 	public static function cron_trigger( $plugin_slug, $to_scan, $import_context = false ) {
 		$plugin = Plugin_Directory::get_plugin_post( $plugin_slug );
 
-		if ( $import_context ) {
+		if ( false !== $import_context ) {
 			Plugin_Scan_Gandalf::dispatch_from_import_context( $plugin, $import_context );
 		}
 

@@ -84,31 +84,43 @@ class API_Update_Updater {
 		}
 
 		$version          = get_post_meta( $post->ID, 'version', true );
+		$stable_tag       = get_post_meta( $post->ID, 'stable_tag', true );
 		$requires_plugins = get_post_meta( $post->ID, 'requires_plugins', true );
-		$release          = Plugin_Directory::get_release( $post, $version );
+		$release          = self::get_release_by_identity( $post, $version, $stable_tag );
+		if ( false === $release ) {
+			return false;
+		}
+
 		$release_time     = self::compute_release_time( $post, $release );
 		$existing_row     = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT version, meta FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s",
+				"SELECT version, stable_tag, meta FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s",
 				$post->post_name
 			)
 		);
-		$existing_version = (string) ( $existing_row->version ?? '' );
+		$existing_version = '';
+		$existing_tag     = '';
+		if ( null !== $existing_row ) {
+			$existing_version = $existing_row->version;
+			$existing_tag     = $existing_row->stable_tag;
+		}
 
-		$release_delay = (int) ( $release['release_delay'] ?? 0 );
+		$release_delay = self::get_release_delay( $release );
 
 		// `update_source.version` is varchar(128); mirror cron_trigger()'s `left( pm.meta_value, 128 )` truncation allowance.
-		$is_new_version = substr( (string) $version, 0, 128 ) !== $existing_version;
+		$is_new_release =
+			substr( $version, 0, 128 ) !== $existing_version ||
+			substr( $stable_tag, 0, 128 ) !== $existing_tag;
 
 		/*
-		 * Hold a blocked version out of the row: the previously served version keeps
+		 * Hold a blocked release out of the row: the previously served release keeps
 		 * being served, and the deferred serve is cancelled rather than postponed.
 		 * Status changes still reach the row right away.
 		 */
-		if ( self::is_release_blocked( $release ) && $is_new_version ) {
+		if ( self::is_release_blocked( $release ) && $is_new_release ) {
 			wp_clear_scheduled_hook( "release_to_update_api:{$post->post_name}" );
 
-			if ( $existing_row ) {
+			if ( null !== $existing_row ) {
 				self::update_row_availability( $post, $existing_row->meta );
 			}
 
@@ -116,7 +128,7 @@ class API_Update_Updater {
 		}
 
 		/*
-		 * Defer the write for new versions still inside the cooldown window. While
+		 * Defer the write for new releases still inside the cooldown window. While
 		 * deferred, the existing `update_source` row (carrying the previous version)
 		 * continues to be served by the update API. Reviewers force-release by setting
 		 * `release_delay = 0` on the release meta.
@@ -125,18 +137,18 @@ class API_Update_Updater {
 		 * gate is false when called from cron_trigger_release() and no explicit bypass
 		 * is needed.
 		 *
-		 * Only the version bump waits for the cooldown: a status change made
+		 * Only the release change waits for the cooldown: a status change made
 		 * mid-cooldown (a closure, a reopen) reaches the existing row right away,
 		 * while it keeps serving the previous release's data. Until the cooldown
 		 * expires, cron_trigger() keeps re-selecting the plugin and this write
 		 * repeats as a no-op.
 		 */
-		if ( $release_delay && $is_new_version ) {
+		if ( 0 < $release_delay && $is_new_release ) {
 			$cooldown_until = $release_time + $release_delay;
 			if ( $cooldown_until > time() ) {
 				self::queue_release_to_update_api( $post->post_name, $cooldown_until );
 
-				if ( $existing_row ) {
+				if ( null !== $existing_row ) {
 					self::update_row_availability( $post, $existing_row->meta );
 				}
 
@@ -148,7 +160,7 @@ class API_Update_Updater {
 		// to now — that's the moment the version is actually available to sites. Keeps
 		// phased_rollout()'s `manual-updates-24hr` window measuring from public availability,
 		// even if the commit/confirmation was long ago because the cooldown deferred the write.
-		if ( $release_delay && $is_new_version ) {
+		if ( 0 < $release_delay && $is_new_release ) {
 			$release_time = time();
 		}
 
@@ -176,7 +188,7 @@ class API_Update_Updater {
 			'plugin_slug'      => $post->post_name,
 			'available'        => (int) self::is_available( $post ),
 			'version'          => $version,
-			'stable_tag'       => get_post_meta( $post->ID, 'stable_tag', true ),
+			'stable_tag'       => $stable_tag,
 			'plugin_name'      => strip_tags( get_post_meta( $post->ID, 'header_name', true ) ),
 			'plugin_name_san'  => sanitize_title_with_dashes( strip_tags( get_post_meta( $post->ID, 'header_name', true ) ) ),
 			'plugin_author'    => strip_tags( get_post_meta( $post->ID, 'header_author', true ) ),
@@ -215,19 +227,29 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * The version currently served from `update_source`.
+	 * The release identity currently served from `update_source`.
 	 *
 	 * @param string $plugin_slug The plugin slug.
-	 * @return string The served version, or '' when the plugin isn't in `update_source`.
+	 * @return array|false The served version and stable tag, or false when the plugin isn't in `update_source`.
 	 */
-	public static function get_served_version( $plugin_slug ) {
+	public static function get_served_release_identity( $plugin_slug ) {
 		global $wpdb;
 
-		return (string) $wpdb->get_var(
+		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT version FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s",
+				"SELECT version, stable_tag FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s",
 				$plugin_slug
-			)
+			),
+			ARRAY_A
+		);
+
+		if ( null === $row ) {
+			return false;
+		}
+
+		return array(
+			'version'    => $row['version'],
+			'stable_tag' => $row['stable_tag'],
 		);
 	}
 
@@ -245,65 +267,128 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * Hold a plugin's current version out of `update_source` until it's force-released.
+	 * Fetch a release by the exact update identity used by WordPress.org.
 	 *
-	 * The block is scoped to this one release: a later version escapes the hold,
-	 * so an author can ship a fix without reviewer intervention, while the held
-	 * version itself stays blocked until a reviewer force-releases it.
+	 * Trunk releases are stored as `trunk@{version}`; tagged releases are stored
+	 * under their stable tag, which does not have to equal the Version header.
 	 *
-	 * The counterpart to force_release(). It refuses when the version cannot be
-	 * held: no plugin, no release, or the version already being served. Blocking
-	 * an already-held release is a no-op success that preserves the existing
+	 * @param \WP_Post $post        The plugin post.
+	 * @param string   $version     The plugin Version header.
+	 * @param string   $release_ref The stable tag, or `trunk`.
+	 * @return array|false The release row, or false when it doesn't exist.
+	 * @throws \UnexpectedValueException When the stored release identity is malformed.
+	 */
+	public static function get_release_by_identity( $post, $version, $release_ref ) {
+		$release = self::get_release_by_ref( $post, $release_ref, $version );
+		if ( false === $release ) {
+			return false;
+		}
+		if ( ! array_key_exists( 'version', $release ) || ! is_string( $release['version'] ) ) {
+			throw new \UnexpectedValueException( 'A plugin release has no valid Version identity.' );
+		}
+		if ( $release['version'] !== $version ) {
+			return false;
+		}
+
+		return $release;
+	}
+
+	/**
+	 * Fetch a release by its exact stored ref without reconstructing from Version.
+	 *
+	 * Tagged refs are deliberately ref-only so a scan can permanently burn a tag
+	 * even if that tag's Version header changes before the callback arrives.
+	 *
+	 * @param \WP_Post $post        The plugin post.
+	 * @param string   $release_ref The stable tag, or `trunk`.
+	 * @param string   $version     The plugin Version header for a trunk release.
+	 * @return array|false The release row, or false when it doesn't exist.
+	 * @throws \UnexpectedValueException When the stored release identity is malformed.
+	 */
+	protected static function get_release_by_ref( $post, $release_ref, $version ) {
+		$release_tag = $release_ref;
+		if ( 'trunk' === $release_ref ) {
+			$release_tag = "trunk@{$version}";
+		}
+
+		$release = Plugin_Directory::get_release( $post, $release_tag );
+
+		if ( false === $release ) {
+			return false;
+		}
+		if ( ! array_key_exists( 'tag', $release ) || ! is_string( $release['tag'] ) ) {
+			throw new \UnexpectedValueException( 'A plugin release has no valid ref identity.' );
+		}
+
+		// get_release() may fall back from a missing tag to a same-version trunk release.
+		if ( $release['tag'] !== $release_tag ) {
+			return false;
+		}
+
+		return $release;
+	}
+
+	/**
+	 * Block a plugin release ref from `update_source`.
+	 *
+	 * The block is scoped to this one release ref: a later tag escapes the hold,
+	 * so an author can ship a fix without reviewer intervention, while the blocked
+	 * tag itself stays burned. A release that is already live cannot be un-shipped,
+	 * but recording its block prevents it from being served again after a later
+	 * release supersedes it.
+	 *
+	 * It refuses when the plugin or exact release does not exist. Blocking an
+	 * already-blocked release is a no-op success that preserves the existing
 	 * block. Capability checks and audit logging are the caller's.
 	 *
 	 * @param string $plugin_slug The plugin slug.
+	 * @param string $version     The scanned plugin Version header.
+	 * @param string $release_ref The scanned stable tag, or `trunk`.
 	 * @param array  $block       The block to record; 'blocked_at' is added here.
-	 * @return bool Whether the version is held as a result.
+	 * @return bool Whether the release is blocked as a result.
 	 */
-	public static function block_release( $plugin_slug, array $block ) {
+	public static function block_release( $plugin_slug, $version, $release_ref, array $block ) {
 		$post = Plugin_Directory::get_plugin_post( $plugin_slug );
 		if ( ! $post ) {
 			return false;
 		}
 
-		$version = get_post_meta( $post->ID, 'version', true );
-		$release = Plugin_Directory::get_release( $post, $version );
-		if ( ! $release ) {
-			return false;
-		}
-
-		// Already live: a block can't un-ship a served version (compared with the column's varchar(128) truncation).
-		if ( self::get_served_version( $plugin_slug ) === substr( (string) $version, 0, 128 ) ) {
+		$release = self::get_release_by_ref( $post, $release_ref, $version );
+		if ( false === $release ) {
 			return false;
 		}
 
 		// Already held; recording a second block would merge it into the first.
-		if ( self::is_release_blocked( $release ) ) {
-			return true;
+		if ( ! self::is_release_blocked( $release ) ) {
+			$block['blocked_at'] = time();
+
+			$recorded = Plugin_Directory::add_release(
+				$post,
+				array(
+					'tag'           => $release['tag'],
+					'release_block' => $block,
+				)
+			);
+			if ( ! $recorded ) {
+				return false;
+			}
 		}
 
-		$block['blocked_at'] = time();
+		$current_version = get_post_meta( $post->ID, 'version', true );
+		$current_ref     = get_post_meta( $post->ID, 'stable_tag', true );
+		$current_tag     = 'trunk' === $current_ref ? "trunk@{$current_version}" : $current_ref;
 
-		$recorded = Plugin_Directory::add_release(
-			$post,
-			array(
-				'tag'           => $release['tag'],
-				'release_block' => $block,
-			)
-		);
-		if ( ! $recorded ) {
-			return false;
+		if ( $current_tag === $release['tag'] ) {
+			// Cancel a serve scheduled for cooldown-end; the row keeps the previous release.
+			return self::update_single_plugin( $plugin_slug );
 		}
-
-		// Cancel a serve scheduled for cooldown-end; the row keeps the previous version.
-		self::update_single_plugin( $plugin_slug );
 
 		return true;
 	}
 
 	/**
 	 * Sync the status-dependent `update_source` fields for a plugin whose
-	 * version bump is deferred by a release cooldown.
+	 * release change is deferred by a release cooldown.
 	 *
 	 * The row keeps serving the previous release's data; only its availability
 	 * and closure meta follow the plugin's current status. `version` and
@@ -391,26 +476,74 @@ class API_Update_Updater {
 	/**
 	 * Determine the release timestamp for a plugin version.
 	 *
-	 * Falls back through the commit timestamp on the plugin post, and is replaced by the
-	 * latest committer-confirmation time when release confirmations are required (the
-	 * version isn't really "released" until the last confirmation lands).
+	 * Uses the stable release activation time, or the plugin modification time
+	 * when that is absent. A later required confirmation moves the timestamp
+	 * forward because the release is not ready before both events have happened.
 	 *
 	 * @param \WP_Post   $post    The plugin post.
 	 * @param array|bool $release The release row from Plugin_Directory::get_release(), or false.
 	 * @return int Unix timestamp.
+	 * @throws \UnexpectedValueException When activation or confirmation state is malformed.
 	 */
 	public static function compute_release_time( $post, $release ) {
-		$release_time = strtotime( $post->version_date ? $post->version_date : $post->post_modified );
-
-		if (
-			$release &&
-			$release['confirmations_required'] &&
-			$release['confirmations']
-		) {
-			$release_time = max( $release['confirmations'] );
+		$version_date = $post->version_date;
+		if ( '' === $version_date ) {
+			$version_date = $post->post_modified;
+		} elseif ( ! is_string( $version_date ) ) {
+			throw new \UnexpectedValueException( 'A plugin release has an invalid version date.' );
 		}
 
-		return $release_time;
+		$release_time = strtotime( $version_date );
+		if ( false === $release_time ) {
+			throw new \UnexpectedValueException( 'A plugin release has no valid activation time.' );
+		}
+
+		if ( false === $release ) {
+			return $release_time;
+		}
+
+		if (
+			! is_array( $release ) ||
+			! array_key_exists( 'confirmations_required', $release ) ||
+			! is_int( $release['confirmations_required'] ) ||
+			$release['confirmations_required'] < 0 ||
+			! array_key_exists( 'confirmations', $release ) ||
+			! is_array( $release['confirmations'] )
+		) {
+			throw new \UnexpectedValueException( 'A plugin release has invalid confirmation state.' );
+		}
+
+		if ( 0 === $release['confirmations_required'] || [] === $release['confirmations'] ) {
+			return $release_time;
+		}
+
+		foreach ( $release['confirmations'] as $confirmation_time ) {
+			if ( ! is_int( $confirmation_time ) || $confirmation_time < 0 ) {
+				throw new \UnexpectedValueException( 'A plugin release has an invalid confirmation time.' );
+			}
+		}
+
+		return max( $release_time, max( $release['confirmations'] ) );
+	}
+
+	/**
+	 * Return a release's required cooldown delay.
+	 *
+	 * @param array $release The release row.
+	 * @return int Cooldown delay in seconds.
+	 * @throws \UnexpectedValueException When release cooldown state is missing or malformed.
+	 */
+	protected static function get_release_delay( $release ) {
+		if (
+			! is_array( $release ) ||
+			! array_key_exists( 'release_delay', $release ) ||
+			! is_int( $release['release_delay'] ) ||
+			$release['release_delay'] < 0
+		) {
+			throw new \UnexpectedValueException( 'A plugin release has no valid release delay.' );
+		}
+
+		return $release['release_delay'];
 	}
 
 	/**
@@ -457,10 +590,11 @@ class API_Update_Updater {
 			return false;
 		}
 
-		$version = get_post_meta( $post->ID, 'version', true );
-		$release = Plugin_Directory::get_release( $post, $version );
+		$version    = get_post_meta( $post->ID, 'version', true );
+		$stable_tag = get_post_meta( $post->ID, 'stable_tag', true );
+		$release    = self::get_release_by_identity( $post, $version, $stable_tag );
 
-		if ( ! $release ) {
+		if ( false === $release ) {
 			return false;
 		}
 
@@ -471,8 +605,8 @@ class API_Update_Updater {
 			$lifted[] = 'lifting the release block';
 		}
 
-		$release_delay = (int) ( $release['release_delay'] ?? 0 );
-		if ( $release_delay && self::compute_release_time( $post, $release ) + $release_delay > time() ) {
+		$release_delay = self::get_release_delay( $release );
+		if ( 0 < $release_delay && self::compute_release_time( $post, $release ) + $release_delay > time() ) {
 			$lifted[] = sprintf( 'bypassing the %d-hour release cooldown', $release_delay / HOUR_IN_SECONDS );
 		}
 
