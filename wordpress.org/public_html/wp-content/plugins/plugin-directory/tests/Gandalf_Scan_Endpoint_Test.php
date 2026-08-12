@@ -9,6 +9,8 @@ declare( strict_types = 1 );
 
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use WordPressdotorg\Plugin_Directory\Jobs\API_Update_Updater;
+use WordPressdotorg\Plugin_Directory\Jobs\Plugin_Scan;
 use WordPressdotorg\Plugin_Directory\Jobs\Plugin_Scan_Gandalf;
 use WordPressdotorg\Plugin_Directory\Plugin_Directory;
 
@@ -84,6 +86,17 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 		update_post_meta( $this->plugin->ID, 'version', self::VERSION );
 		update_post_meta( $this->plugin->ID, 'stable_tag', self::VERSION );
+		update_post_meta( $this->plugin->ID, 'releases', array() );
+		$this->assertTrue(
+			Plugin_Directory::add_release(
+				$this->plugin,
+				array(
+					'tag'           => self::VERSION,
+					'version'       => self::VERSION,
+					'release_delay' => DAY_IN_SECONDS,
+				)
+			)
+		);
 		update_post_meta(
 			$this->plugin->ID,
 			Plugin_Scan_Gandalf::PENDING_META_KEY,
@@ -200,6 +213,35 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 	}
 
 	/**
+	 * Dispatch a frozen import context and return its Gandalf request body.
+	 *
+	 * @param array $context The queued import context.
+	 * @return array The decoded request body.
+	 */
+	private function dispatch_import_context( array $context ): array {
+		$body        = null;
+		$http_filter = static function ( $preempt, $args ) use ( &$body ) {
+			$body = json_decode( $args['body'], true );
+			return array(
+				'body'     => wp_json_encode( array( 'scan_id' => $body['scan_id'] ) ),
+				'response' => array( 'code' => 202 ),
+			);
+		};
+		add_filter( 'pre_http_request', $http_filter, 10, 2 );
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_set_error_handler -- Intercepts the expected dispatch notice.
+		set_error_handler( static fn( $level ) => E_USER_NOTICE === $level );
+		try {
+			Plugin_Scan::cron_trigger( $this->plugin->post_name, array(), $context );
+		} finally {
+			restore_error_handler();
+			remove_filter( 'pre_http_request', $http_filter );
+		}
+
+		$this->assertIsArray( $body );
+		return $body;
+	}
+
+	/**
 	 * A production-shaped callback is accepted end to end.
 	 */
 	public function test_callback_is_accepted(): void {
@@ -209,6 +251,205 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 		$this->assertSame( array( 'success' => true ), $response->get_data() );
 
 		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+		$this->assertFalse( API_Update_Updater::is_release_blocked( Plugin_Directory::get_release( $this->plugin, self::VERSION ) ) );
+	}
+
+	/**
+	 * Delayed dispatch keeps the imported candidate and last-served baseline.
+	 */
+	public function test_dispatch_uses_frozen_candidate_and_served_release(): void {
+		$served_release            = Plugin_Directory::get_release( $this->plugin, self::VERSION );
+		$served_release['tag']     = 'release-2.6.0';
+		$served_release['version'] = '2.6.0';
+		update_post_meta( $this->plugin->ID, 'releases', array( $served_release, Plugin_Directory::get_release( $this->plugin, self::VERSION ) ) );
+		update_post_meta( $this->plugin->ID, 'stable_tag', 'candidate-tag' );
+		update_post_meta( $this->plugin->ID, 'last_version', '2.6.5' );
+		update_post_meta( $this->plugin->ID, 'last_stable_tag', 'release-2.6.5' );
+
+		global $wpdb;
+		$wpdb->insert(
+			$wpdb->prefix . 'update_source',
+			array(
+				'plugin_id'        => $this->plugin->ID,
+				'plugin_slug'      => $this->plugin->post_name,
+				'available'        => 1,
+				'version'          => '2.6.0',
+				'stable_tag'       => 'release-2.6.0',
+				'plugin_name'      => $this->plugin->post_title,
+				'requires_plugins' => '',
+				'last_updated'     => $this->plugin->post_modified,
+			)
+		);
+
+		$context         = null;
+		$schedule_filter = static function ( $pre, $event ) use ( &$context ) {
+			$context = $event->args[2];
+			return false;
+		};
+		add_filter( 'pre_schedule_event', $schedule_filter, 10, 2 );
+		try {
+			do_action( 'wporg_plugins_imported', $this->plugin, 'candidate-tag', 'release-2.6.5', array( 'candidate-tag' ), 123, array(), self::VERSION );
+		} finally {
+			remove_filter( 'pre_schedule_event', $schedule_filter );
+		}
+
+		$this->assertIsArray( $context );
+
+		update_post_meta( $this->plugin->ID, 'version', '2.8.0' );
+		update_post_meta( $this->plugin->ID, 'stable_tag', '2.8.0' );
+		$wpdb->update(
+			$wpdb->prefix . 'update_source',
+			array(
+				'version'    => '2.8.0',
+				'stable_tag' => '2.8.0',
+			),
+			array( 'plugin_slug' => $this->plugin->post_name )
+		);
+
+		$body = $this->dispatch_import_context( $context );
+
+		$this->assertSame( self::VERSION, $body['version'] );
+		$this->assertSame( 'candidate-tag', $body['release_ref'] );
+		$this->assertStringEndsWith( '.candidate-tag.zip', $body['current_zip_url'] );
+		$this->assertSame( '2.6.0', $body['previous_version'] );
+		$this->assertSame( 'release-2.6.0', $body['previous_release_ref'] );
+		$this->assertStringEndsWith( '.release-2.6.0.zip', $body['previous_zip_url'] );
+
+		$candidate_release = Plugin_Directory::get_release( $this->plugin, self::VERSION );
+		update_post_meta( $this->plugin->ID, 'releases', array( $candidate_release ) );
+		$body = $this->dispatch_import_context( $context );
+		$this->assertNull( $body['previous_version'] );
+		$this->assertNull( $body['previous_release_ref'] );
+		$this->assertNull( $body['previous_zip_url'] );
+
+		$served_release['release_block'] = array( 'reason' => 'Test block.' );
+		update_post_meta( $this->plugin->ID, 'releases', array( $served_release, $candidate_release ) );
+		$body = $this->dispatch_import_context( $context );
+		$this->assertNull( $body['previous_version'] );
+		$this->assertNull( $body['previous_release_ref'] );
+		$this->assertNull( $body['previous_zip_url'] );
+	}
+
+	/**
+	 * A reused ref cannot provide distinct previous bytes after its Version changes.
+	 */
+	public function test_dispatch_omits_same_ref_baseline_after_version_change(): void {
+		$release            = Plugin_Directory::get_release( $this->plugin, self::VERSION );
+		$release['tag']     = 'shared-tag';
+		$release['version'] = '2.8.0';
+		update_post_meta( $this->plugin->ID, 'releases', array( $release ) );
+
+		$body = $this->dispatch_import_context(
+			array(
+				'stable_tag'       => 'shared-tag',
+				'old_stable_tag'   => 'shared-tag',
+				'changed_svn_tags' => array( 'shared-tag' ),
+				'version'          => '2.8.0',
+				'served_release'   => array(
+					'version'    => self::VERSION,
+					'stable_tag' => 'shared-tag',
+				),
+			)
+		);
+
+		$this->assertNull( $body['previous_version'] );
+		$this->assertNull( $body['previous_release_ref'] );
+		$this->assertNull( $body['previous_zip_url'] );
+	}
+
+	/**
+	 * A lost acknowledgement keeps a superseded scan blockable.
+	 */
+	public function test_lost_dispatch_ack_keeps_superseded_callback_identity(): void {
+		$scan_id     = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+		$old_scan_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+		$pending     = get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true );
+
+		$pending[ $old_scan_id ] = array(
+			'version'      => '2.6.0',
+			'release_ref'  => 'release-2.6.0',
+			'requested_at' => time() - 2 * DAY_IN_SECONDS,
+		);
+		update_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, $pending );
+
+		$http_filter = static function () {
+			return new \WP_Error( 'http_request_failed', 'Connection closed before acknowledgement.' );
+		};
+		add_filter( 'pre_http_request', $http_filter );
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_set_error_handler -- Intercepts the expected dispatch notice.
+		set_error_handler( static fn( $level ) => E_USER_NOTICE === $level );
+		try {
+			$this->assertFalse(
+				Plugin_Scan_Gandalf::dispatch(
+					$this->plugin,
+					array(
+						'scan_id'      => $scan_id,
+						'version'      => self::VERSION,
+						'release_ref'  => self::VERSION,
+						'requested_at' => time(),
+					)
+				)
+			);
+		} finally {
+			restore_error_handler();
+			remove_filter( 'pre_http_request', $http_filter );
+		}
+
+		$pending = get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true );
+		$this->assertArrayHasKey( $old_scan_id, $pending );
+		update_post_meta( $this->plugin->ID, 'version', '2.8.0' );
+		update_post_meta( $this->plugin->ID, 'stable_tag', '2.8.0' );
+
+		$response = $this->dispatch(
+			$this->payload(
+				array(
+					'scan_id'        => $scan_id,
+					'max_risk_score' => 8.0,
+				)
+			)
+		);
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertTrue( API_Update_Updater::is_release_blocked( Plugin_Directory::get_release( $this->plugin, self::VERSION ) ) );
+	}
+
+	/**
+	 * A scan is not sent unless its callback identity was persisted first.
+	 */
+	public function test_dispatch_stops_when_pending_identity_cannot_be_stored(): void {
+		$http_filter = function () {
+			$this->fail( 'The request should not have been sent.' );
+		};
+		add_filter( 'update_post_metadata', '__return_false' );
+		add_filter( 'pre_http_request', $http_filter );
+		$this->expectException( \UnexpectedValueException::class );
+		$this->expectExceptionMessage( 'could not be stored' );
+		try {
+			Plugin_Scan_Gandalf::dispatch(
+				$this->plugin,
+				array(
+					'scan_id'      => 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+					'version'      => self::VERSION,
+					'release_ref'  => self::VERSION,
+					'requested_at' => time(),
+				)
+			);
+		} finally {
+			remove_filter( 'update_post_metadata', '__return_false' );
+			remove_filter( 'pre_http_request', $http_filter );
+		}
+	}
+
+	/**
+	 * A high-risk callback remains pending when its release cannot be blocked.
+	 */
+	public function test_block_failure_is_not_consumed_as_advisory(): void {
+		update_post_meta( $this->plugin->ID, 'releases', array() );
+
+		$response = $this->dispatch( $this->payload( array( 'max_risk_score' => 9.0 ) ) );
+
+		$this->assertSame( 500, $response->get_status() );
+		$this->assertArrayHasKey( self::SCAN_ID, get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
 	}
 
 	/**
@@ -241,13 +482,13 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 	/**
 	 * Contract additions the directory does not know yet — new fields at any
-	 * level, a new severity, a recalibrated score — do not void a delivery.
+	 * level and a new severity do not void a delivery.
 	 */
 	public function test_unknown_contract_additions_are_accepted(): void {
 		$payload = $this->payload(
 			array(
 				'scan_duration'  => 314,
-				'max_risk_score' => 10.5,
+				'max_risk_score' => 9.5,
 			)
 		);
 
@@ -259,6 +500,17 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 		$this->assertSame( 200, $response->get_status() );
 		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+	}
+
+	/**
+	 * Policy never acts on a missing or out-of-range maximum risk score.
+	 */
+	public function test_invalid_policy_score_is_rejected(): void {
+		$response = $this->dispatch( $this->payload( array( 'max_risk_score' => 10.5 ) ) );
+
+		$this->assertSame( 400, $response->get_status() );
+		$this->assertArrayHasKey( self::SCAN_ID, get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+		$this->assertSame( 'invalid_gandalf_scan', get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::LAST_ERROR_META_KEY, true )['kind'] );
 	}
 
 	/**

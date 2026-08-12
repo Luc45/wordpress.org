@@ -44,7 +44,7 @@ class Manager {
 		add_action( 'plugin_directory_daily_post_checks', array( __NAMESPACE__ . '\Daily_Post_Checks', 'cron_trigger' ) );
 
 		// Hook into the plugin import process to queue a job.
-		add_action( 'wporg_plugins_imported', array( __NAMESPACE__ . '\Plugin_Scan', 'wporg_plugins_imported' ), 10, 6 );
+		add_action( 'wporg_plugins_imported', array( __NAMESPACE__ . '\Plugin_Scan', 'wporg_plugins_imported' ), 10, 7 );
 
 		// A cronjob to check cronjobs
 		add_action( 'plugin_directory_check_cronjobs', array( $this, 'register_cron_tasks' ) );
