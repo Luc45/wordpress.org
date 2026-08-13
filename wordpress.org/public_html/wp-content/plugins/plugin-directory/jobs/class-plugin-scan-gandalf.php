@@ -196,7 +196,7 @@ class Plugin_Scan_Gandalf {
 	/**
 	 * Handle a completed or failed scan callback.
 	 *
-	 * @param \WP_Post $plugin The plugin post.
+	 * @param \WP_Post $plugin    The plugin post.
 	 * @param array    $data      The Gandalf callback data.
 	 * @param string   $body_hash SHA-256 of the exact callback request body.
 	 * @return true|WP_Error True on success, or an error when the scan is unknown.
