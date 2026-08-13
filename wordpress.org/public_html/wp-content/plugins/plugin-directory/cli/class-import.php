@@ -561,31 +561,41 @@ class Import {
 
 		$this->rebuild_affected_zips( $plugin_slug, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered );
 
-		// If we've got a new version, store the last version in the plugin meta.
+		// Preserve version history for non-empty Version changes; "0" is a valid Version string.
 		if ( '' !== $version && $version !== $plugin->version ) {
 			update_post_meta( $plugin->ID, 'last_version', wp_slash( $plugin->version ) );
 			update_post_meta( $plugin->ID, 'last_stable_tag', wp_slash( $current_stable_tag ) );
 			update_post_meta( $plugin->ID, 'last_version_date', wp_slash( $plugin->version_date ) );
 		}
 
-		// A new stable identity starts a new release window, even when its Version header is unchanged.
+		/*
+		 * A different Version/stable-tag pair identifies another candidate release.
+		 * Give tag-only changes their own activation time so cooldown calculation
+		 * cannot inherit the prior pair's timestamp.
+		 */
 		$is_new_stable_release = $version !== $plugin->version || $stable_tag !== $current_stable_tag;
 		if ( '' !== $version && $is_new_stable_release ) {
 			update_post_meta( $plugin->ID, 'version_date', wp_slash( current_time( 'mysql' ) ) );
 		}
 
-		// Finally, set the new version live.
+		// Store the imported candidate identity on the plugin post.
 		update_post_meta( $plugin->ID, 'stable_tag', wp_slash( $stable_tag ) );
 		update_post_meta( $plugin->ID, 'version',    wp_slash( $version ) );
 		// Update the list of tags last, as it controls which ZIPs are present in the 'Previous versions' section and info API.
 		update_post_meta( $plugin->ID, 'tags',       wp_slash( $tagged_versions ) );
 
-		// Ensure that the API gets the updated data
+		// Reconcile the candidate with `update_source`; a cooldown or block may
+		// preserve the previously recorded release pair.
 		API_Update_Updater::update_single_plugin( $plugin->post_name );
 		Plugins_Info_API::flush_plugin_information_cache( $plugin->post_name );
 
 		/**
 		 * Action that fires after a plugin is imported.
+		 *
+		 * The Version/stable-tag pair is importer-owned event data. Pass Version
+		 * explicitly because queued consumers may run after post meta has advanced.
+		 * Update API reconciliation runs before this action; `update_source` is
+		 * therefore the source for the recorded update pair when one exists.
 		 *
 		 * @param WP_Post $plugin         The plugin updated.
 		 * @param string  $stable_tag     The new stable tag for the plugin.
@@ -593,7 +603,7 @@ class Import {
 		 * @param array   $changed_tags   The list of SVN tags/trunk affected to trigger the import.
 		 * @param int     $svn_revision   The SVN revision that triggered the import.
 		 * @param array   $warnings       The list of warnings generated during the import process.
-		 * @param string  $version        The imported plugin Version header.
+		 * @param string  $version        The Version header parsed by this import.
 		 */
 		do_action( 'wporg_plugins_imported', $plugin, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered, $this->warnings, $version );
 

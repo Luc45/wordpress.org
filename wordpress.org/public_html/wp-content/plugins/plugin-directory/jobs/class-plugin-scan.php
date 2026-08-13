@@ -16,13 +16,17 @@ class Plugin_Scan {
 	/**
 	 * Watch for plugin imports and queue a scan job if needed.
 	 *
+	 * The importer owns the candidate Version/stable-tag pair; `update_source`
+	 * owns the recorded update pair. Capture both before queueing because cron
+	 * may run after another import has changed either source.
+	 *
 	 * @param \WP_Post $plugin           The plugin post.
 	 * @param string   $stable_tag       The new stable tag.
 	 * @param string   $old_stable_tag   The old stable tag.
 	 * @param array    $changed_svn_tags The SVN tags that were changed.
 	 * @param int      $svn_revision     The SVN revision number.
 	 * @param array    $warnings         The import warnings.
-	 * @param string   $version          The imported plugin Version header.
+	 * @param string   $version          The Version header parsed by this import.
 	 */
 	public static function wporg_plugins_imported( $plugin, $stable_tag, $old_stable_tag, $changed_svn_tags, $svn_revision, $warnings, $version ) {
 		$to_scan = [];
@@ -70,7 +74,7 @@ class Plugin_Scan {
 	 * @param array  $args        The data to pass to the job.
 	 */
 	public static function queue( $plugin_slug, ...$args ) {
-		// To avoid a situation where two imports run concurrently, if one is already scheduled, run it 1hr later (We'll trigger it after the current one finishes).
+		// Run promptly unless another scan is waiting; space queued scans one hour apart.
 		$when_to_run = time() + 5;
 		if ( $next_scheduled = Manager::get_scheduled_time( "scan_plugin:{$plugin_slug}", 'last' ) ) {
 			$when_to_run = $next_scheduled + HOUR_IN_SECONDS;
@@ -86,13 +90,14 @@ class Plugin_Scan {
 	/**
 	 * Cron callback to scan a plugin update.
 	 *
-	 * @param string     $plugin_slug    The plugin slug.
-	 * @param array      $to_scan        The tags to scan with PCP.
-	 * @param array|bool $import_context The importer release context, or false if absent.
+	 * @param string      $plugin_slug    The plugin slug.
+	 * @param array       $to_scan        The tags to scan with PCP.
+	 * @param array|false $import_context Identities captured at import, or false if absent.
 	 */
 	public static function cron_trigger( $plugin_slug, $to_scan, $import_context = false ) {
 		$plugin = Plugin_Directory::get_plugin_post( $plugin_slug );
 
+		// Only explicit absence skips Gandalf; malformed context must reach validation.
 		if ( false !== $import_context ) {
 			Plugin_Scan_Gandalf::dispatch_from_import_context( $plugin, $import_context );
 		}

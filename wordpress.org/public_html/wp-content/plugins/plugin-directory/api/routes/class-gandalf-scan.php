@@ -16,6 +16,10 @@ use WP_Http;
 /**
  * Callback endpoint for security scan results.
  *
+ * This route owns the raw HTTP trust boundary: it selects the terminal-status
+ * schema, validates the exact callback shape and cross-field evidence, and
+ * passes validated data plus exact-body identity to the scan job.
+ *
  * @package WordPressdotorg_Plugin_Directory
  */
 class Gandalf_Scan extends Base {
@@ -53,6 +57,9 @@ class Gandalf_Scan extends Base {
 
 	/**
 	 * Return the exact callback schema selected by its terminal status.
+	 *
+	 * Completed and failed callbacks have disjoint required fields. Selecting one
+	 * closed schema here avoids downstream defaults for status-specific evidence.
 	 *
 	 * @param string $status Callback status.
 	 * @return array JSON schema for the selected callback.
@@ -225,6 +232,10 @@ class Gandalf_Scan extends Base {
 
 	/**
 	 * Validate cross-field invariants not expressible in the REST schema.
+	 *
+	 * The schema owns exact object fields and scalar ranges. This pass owns facts
+	 * derived across fields: JSON object/array distinctions, aggregate counts,
+	 * score consistency, investigation state, paths, and byte limits.
 	 *
 	 * @param array     $data         Parsed callback body.
 	 * @param \stdClass $decoded_body Parsed body preserving JSON object/array distinctions.
@@ -471,6 +482,10 @@ class Gandalf_Scan extends Base {
 	/**
 	 * Receive a security scan callback.
 	 *
+	 * The URL slug owns routing; the body slug is an assertion. Preserve the raw
+	 * body because replay identity is its SHA-256, not `verdict_hash` or re-encoded
+	 * JSON.
+	 *
 	 * @param \WP_REST_Request $request The request.
 	 * @return array|WP_Error Callback response, or an error.
 	 */
@@ -487,6 +502,7 @@ class Gandalf_Scan extends Base {
 
 		$raw_body = $request->get_body();
 
+		// Decode once for JSON object/array identity and once for validated PHP access.
 		try {
 			$decoded_body = json_decode( $raw_body, false, 512, JSON_THROW_ON_ERROR );
 			$data         = json_decode( $raw_body, true, 512, JSON_THROW_ON_ERROR );

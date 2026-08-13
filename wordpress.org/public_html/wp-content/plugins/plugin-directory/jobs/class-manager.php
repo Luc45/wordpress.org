@@ -43,7 +43,7 @@ class Manager {
 		add_action( 'plugin_directory_zip_cleanup', array( __NAMESPACE__ . '\Zip_Cleanup', 'cron_trigger' ) );
 		add_action( 'plugin_directory_daily_post_checks', array( __NAMESPACE__ . '\Daily_Post_Checks', 'cron_trigger' ) );
 
-		// Hook into the plugin import process to queue a job.
+		// Accept the importer-owned Version header so delayed scans never reread mutable post meta.
 		add_action( 'wporg_plugins_imported', array( __NAMESPACE__ . '\Plugin_Scan', 'wporg_plugins_imported' ), 10, 7 );
 
 		// A cronjob to check cronjobs

@@ -16,29 +16,29 @@ use WP_Http;
  * Sends plugin updates to Gandalf for security scans and acts on the results.
  *
  * Completed scans whose maximum risk score reaches the block threshold record
- * a block on the scanned release ref pending review. Unserved refs stay out of
- * the update API; already-served refs cannot be selected again after supersession.
+ * a block on the scanned release ref pending review. Refs not yet recorded in
+ * the update API stay out; recorded refs are burned against reuse after supersession.
  *
  * @package WordPressdotorg\Plugin_Directory\Jobs
  */
 class Plugin_Scan_Gandalf {
 
-	/** Pending scans keyed by scan_id, used to recognize callbacks. */
+	/** Frozen candidate identities keyed by scan ID for callback validation and blocking. */
 	const PENDING_META_KEY = '_gandalf_scan_pending';
 
-	/** Verdict hashes already sent to Slack, to avoid duplicate alerts. */
+	/** Verdict hashes used to deduplicate advisory Slack alerts. */
 	const NOTIFIED_META_KEY = '_gandalf_scan_notified';
 
 	/** Last dispatch or callback error for quick operator debugging. */
 	const LAST_ERROR_META_KEY = '_gandalf_scan_last_error';
 
-	/** Consumed callbacks keyed by scan_id, to acknowledge retries without repeating effects. */
+	/** Exact callback-body digests keyed by scan ID after callback consumption. */
 	const CONSUMED_META_KEY = '_gandalf_scan_consumed';
 
-	/** Bounded evidence snapshot of the last completed scan. */
+	/** Bounded UI projection of the last completed scan and its WPORG action. */
 	const LAST_RESULT_META_KEY = '_gandalf_scan_last_result';
 
-	/** Completed scans with a max risk score at or above this have their release blocked pending review. */
+	/** WordPress.org's inclusive policy threshold on Gandalf's 0-10 risk score. */
 	const BLOCK_RISK_SCORE = 8.0;
 
 	/** Gandalf scan endpoint. */
@@ -46,6 +46,13 @@ class Plugin_Scan_Gandalf {
 
 	/**
 	 * Dispatch a Gandalf scan from the importer context carried through cron.
+	 *
+	 * Candidate and recorded update identities were captured before this delayed
+	 * job was queued. Do not replace them with current post meta or `update_source`:
+	 * either may now describe a later release.
+	 *
+	 * These snapshots freeze routing identity, not ZIP contents; the download
+	 * aliases can still be rebuilt independently of this job.
 	 *
 	 * @param \WP_Post $plugin         The plugin post.
 	 * @param array    $import_context The importer context.
@@ -117,6 +124,11 @@ class Plugin_Scan_Gandalf {
 		// The delayed cron must use the version frozen by the triggering import.
 		$version = $import_context['version'];
 
+		/*
+		 * Previous-release fields are one all-or-null tuple. Only a distinct, non-trunk
+		 * recorded pair is eligible; it must resolve to an exact release record. A
+		 * blocked baseline remains null so Gandalf scans the whole current tree.
+		 */
 		$previous_release_ref = null;
 		$previous_version     = null;
 		$previous_zip_url     = null;
@@ -158,6 +170,11 @@ class Plugin_Scan_Gandalf {
 
 	/**
 	 * POST a queued scan request to Gandalf.
+	 *
+	 * Persist callback identity before the request because remote acceptance and
+	 * the local acknowledgement can be separated by a transport failure. A valid
+	 * acknowledgement confirms dispatch. Failures conservatively retain pending
+	 * state so an accepted request whose acknowledgement was lost is still known.
 	 *
 	 * @param \WP_Post $plugin       The plugin post.
 	 * @param array    $request_data The Gandalf scan request data.
@@ -234,6 +251,10 @@ class Plugin_Scan_Gandalf {
 	/**
 	 * Handle a completed or failed scan callback.
 	 *
+	 * The pending record is the authoritative candidate identity; current plugin
+	 * metadata may have advanced while the scan ran. The exact body digest identifies
+	 * callback replays independently of Gandalf's result-level `verdict_hash`.
+	 *
 	 * @param \WP_Post $plugin The plugin post.
 	 * @param array    $data   The security scan callback data, validated by the route.
 	 * @param string   $digest SHA-256 of the exact received callback body.
@@ -243,9 +264,9 @@ class Plugin_Scan_Gandalf {
 		$scan_id = $data['scan_id'];
 
 		/*
-		 * Serialize processing per plugin, not per scan: callbacks read-modify-write
-		 * shared per-plugin meta, and a scanner retry racing a slow first delivery
-		 * waits for the consumed record.
+		 * Serialize processing per plugin, not per scan, because callbacks modify shared
+		 * per-plugin metadata. A racing delivery receives a retryable conflict; a later
+		 * retry can then observe the consumed record.
 		 */
 		if ( ! wp_cache_add( 'gandalf-scan-callback-' . $plugin->ID, 1, 'plugin-scans', 5 * MINUTE_IN_SECONDS ) ) {
 			return new WP_Error( 'security_scan_locked', 'A security scan callback for this plugin is already being processed.', [ 'status' => WP_Http::CONFLICT ] );
@@ -259,9 +280,13 @@ class Plugin_Scan_Gandalf {
 	}
 
 	/**
-	 * Consume a validated callback exactly once and apply scan policy.
+	 * Recognize exact callback replays and apply scan policy.
 	 *
-	 * Runs under the per-plugin lock taken by handle_callback().
+	 * Runs under the per-plugin lock taken by handle_callback(). Once the consumed
+	 * digest exists, identical bodies are acknowledged and different bodies conflict.
+	 * Policy, evidence, note, and notification writes happen before that marker so
+	 * an interrupted block is not acknowledged as complete; those writes are not one
+	 * atomic transaction, so an interrupted delivery may repeat non-block effects.
 	 *
 	 * @param \WP_Post $plugin The plugin post.
 	 * @param array    $data   The validated security scan callback data.
@@ -359,9 +384,9 @@ class Plugin_Scan_Gandalf {
 		}
 
 		/*
-		 * Deliberately recorded after the policy effects, failing closed: a crash
-		 * mid-processing makes the retry re-apply effects (the block itself is
-		 * precondition-guarded) rather than acknowledge a block that never happened.
+		 * Record consumption only after policy and evidence. A failure must not
+		 * acknowledge an unapplied block; a retry may repeat non-block side effects
+		 * because these writes do not share a transaction.
 		 */
 		$consumed[ $scan_id ] = [
 			'digest' => $digest,
@@ -375,15 +400,16 @@ class Plugin_Scan_Gandalf {
 	}
 
 	/**
-	 * Block the scanned release, once the verdict is known to still apply to it.
+	 * Block the release identity recorded by the pending scan.
 	 *
 	 * The exact scanned ref is blocked even when a newer release superseded it or
-	 * it was already served. That cannot un-ship an already-live release, but it
-	 * prevents the burned ref from becoming eligible again later.
+	 * `update_source` already records it. The pending record freezes release labels,
+	 * not immutable ZIP bytes. The block cannot recall an update already delivered,
+	 * but prevents the burned ref from becoming eligible again later.
 	 *
 	 * @param \WP_Post $plugin The plugin post.
 	 * @param array    $record The completed scan record.
-	 * @throws \RuntimeException When the audit note cannot be attributed or recorded.
+	 * @throws \UnexpectedValueException When stored release state is malformed.
 	 * @return bool Whether the release was blocked.
 	 */
 	protected static function block_release( $plugin, $record ) {
@@ -476,7 +502,7 @@ class Plugin_Scan_Gandalf {
 		$scan_id = sanitize_text_field( $request_data['scan_id'] );
 
 		self::record_last_error( $plugin, $kind, $message, $scan_id );
-		// Keep the pending identity: a transport or acknowledgement failure does not prove Gandalf rejected the request.
+		// Retain identity after failure so uncertain acceptance can still produce a known callback.
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Routed to the error log via E_USER_NOTICE; raw is fine.
 		trigger_error( sprintf( 'Failed to dispatch Gandalf scan for %s: %s', $plugin->post_name, $message ), E_USER_NOTICE );
