@@ -561,7 +561,7 @@ class Import {
 
 		$this->rebuild_affected_zips( $plugin_slug, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered );
 
-		// If we've got a new version, store the last version in the plugin meta.
+		// Preserve version history for non-empty Version changes; "0" is a valid Version string.
 		if ( '' !== $version && $version !== $plugin->version ) {
 			update_post_meta( $plugin->ID, 'last_version', wp_slash( $plugin->version ) );
 			update_post_meta( $plugin->ID, 'last_stable_tag', wp_slash( $current_stable_tag ) );
@@ -570,21 +570,31 @@ class Import {
 			// Keep the date of the last version change, this often differs from the last_updated/post_modified dates.
 			update_post_meta( $plugin->ID, 'version_date', wp_slash( current_time( 'mysql' ) ) );
 		} elseif ( '' !== $version && $stable_tag !== $current_stable_tag ) {
+			/*
+			 * Changing the stable tag selects another release even when the Version
+			 * header is unchanged; record when that release was selected.
+			 */
 			update_post_meta( $plugin->ID, 'version_date', wp_slash( current_time( 'mysql' ) ) );
 		}
 
-		// Finally, set the new version live.
+		// Store the imported release identity on the plugin post.
 		update_post_meta( $plugin->ID, 'stable_tag', wp_slash( $stable_tag ) );
 		update_post_meta( $plugin->ID, 'version',    wp_slash( $version ) );
 		// Update the list of tags last, as it controls which ZIPs are present in the 'Previous versions' section and info API.
 		update_post_meta( $plugin->ID, 'tags',       wp_slash( $tagged_versions ) );
 
-		// Ensure that the API gets the updated data
+		// Reconcile the imported identity with the update API; a cooldown or block
+		// may keep the previous release served.
 		API_Update_Updater::update_single_plugin( $plugin->post_name );
 		Plugins_Info_API::flush_plugin_information_cache( $plugin->post_name );
 
 		/**
 		 * Action that fires after a plugin is imported.
+		 *
+		 * The parsed Version header is passed explicitly because consumers may
+		 * queue work that runs after plugin meta has advanced to a later import.
+		 * Update API reconciliation runs before this action, and its row remains the
+		 * source of truth for the release served at this import boundary.
 		 *
 		 * @param WP_Post $plugin         The plugin updated.
 		 * @param string  $stable_tag     The new stable tag for the plugin.
@@ -592,7 +602,7 @@ class Import {
 		 * @param array   $changed_tags   The list of SVN tags/trunk affected to trigger the import.
 		 * @param int     $svn_revision   The SVN revision that triggered the import.
 		 * @param array   $warnings       The list of warnings generated during the import process.
-		 * @param string  $version        The imported plugin Version header.
+		 * @param string  $version        The Version header parsed by this import.
 		 */
 		do_action( 'wporg_plugins_imported', $plugin, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered, $this->warnings, $version );
 

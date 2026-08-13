@@ -83,6 +83,10 @@ class API_Update_Updater {
 			return true;
 		}
 
+		/*
+		 * Plugin meta selects the current candidate; `update_source` records the
+		 * update API identity. Keep both halves of each identity together.
+		 */
 		$version          = get_post_meta( $post->ID, 'version', true );
 		$stable_tag       = get_post_meta( $post->ID, 'stable_tag', true );
 		$requires_plugins = get_post_meta( $post->ID, 'requires_plugins', true );
@@ -99,15 +103,20 @@ class API_Update_Updater {
 
 		$release_delay = (int) ( $release['release_delay'] ?? 0 );
 
-		// `update_source.version` is varchar(128); mirror cron_trigger()'s `left( pm.meta_value, 128 )` truncation allowance.
+		/*
+		 * A stable-tag change is a new release even when Version is reused, so both
+		 * fields participate in cooldown and blocking. Both columns are varchar(128);
+		 * mirror cron_trigger()'s truncation allowance.
+		 */
 		$is_new_release =
 			substr( (string) $version, 0, 128 ) !== $existing_version ||
 			substr( (string) $stable_tag, 0, 128 ) !== $existing_tag;
 
 		/*
-		 * Hold a blocked version out of the row: the previously served version keeps
-		 * being served, and the deferred serve is cancelled rather than postponed.
-		 * Status changes still reach the row right away.
+		 * Keep a burned candidate out of `update_source`. The row retains the previous
+		 * release identity. Clear the now-pointless delayed event; the persistent
+		 * block keeps the ref out after cooldown. Availability still follows plugin
+		 * status without changing that identity.
 		 */
 		if ( self::is_release_blocked( $release ) && $is_new_release ) {
 			wp_clear_scheduled_hook( "release_to_update_api:{$post->post_name}" );
@@ -121,13 +130,12 @@ class API_Update_Updater {
 
 		/*
 		 * Defer a new release identity still inside the cooldown window. While
-		 * deferred, the existing `update_source` row (carrying the previous version)
-		 * continues to be served by the update API. Reviewers force-release by setting
-		 * `release_delay = 0` on the release meta.
+		 * deferred, the existing `update_source` row (carrying the previously served
+		 * release) continues to be served by the update API. Reviewers force-release
+		 * by setting `release_delay = 0` on the release meta.
 		 *
-		 * The deferred cron fires at exactly $cooldown_until, so by definition this
-		 * gate is false when called from cron_trigger_release() and no explicit bypass
-		 * is needed.
+		 * The event is scheduled for $cooldown_until. Whenever WP-Cron runs it, this
+		 * time gate is false, so no explicit bypass is needed.
 		 *
 		 * Only the release change waits for the cooldown: a status change made
 		 * mid-cooldown (a closure, a reopen) reaches the existing row right away,
@@ -148,10 +156,7 @@ class API_Update_Updater {
 			}
 		}
 
-		// When publishing a new version under an active cooldown, anchor `release_time`
-		// to now — that's the moment the version is actually available to sites. Keeps
-		// phased_rollout()'s `manual-updates-24hr` window measuring from public availability,
-		// even if the commit/confirmation was long ago because the cooldown deferred the write.
+		// On the first write after cooldown, record the public availability time.
 		if ( $release_delay && $is_new_release ) {
 			$release_time = time();
 		}
@@ -236,10 +241,14 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * The version and stable tag currently served from `update_source`.
+	 * Read the release identity recorded in `update_source`.
+	 *
+	 * Plugin meta may already describe a candidate held by a block or cooldown;
+	 * `update_source` remains on the prior release. Read both columns together so
+	 * delayed scans receive the authoritative served identity for baseline selection.
 	 *
 	 * @param string $plugin_slug The plugin slug.
-	 * @return array|false The served identity, or false when no row exists.
+	 * @return array|false The served Version and stable tag, or false when absent.
 	 */
 	public static function get_served_release_identity( $plugin_slug ) {
 		global $wpdb;
@@ -256,10 +265,16 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * Fetch a release by its exact storage ref, without tag-to-trunk fallback.
+	 * Resolve the release record that owns an exact release ref.
+	 *
+	 * Tagged releases are identified by tag, not by their mutable Version header,
+	 * so changing that header cannot escape a block attached to the tag. Trunk is
+	 * reusable and is therefore stored as `trunk@{$version}`. `get_release()` may
+	 * fall back from a missing tag to same-Version trunk; reject that fallback so
+	 * the wrong ref is never blocked or force-released.
 	 *
 	 * @param \WP_Post $post        The plugin post.
-	 * @param string   $version     The plugin Version header.
+	 * @param string   $version     The Version used to qualify `trunk`.
 	 * @param string   $release_ref The stable tag, or `trunk`.
 	 * @return array|false The matching release, or false.
 	 */
@@ -271,29 +286,37 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * Whether a release is being held out of `update_source` by a block.
+	 * Whether a release ref is burned by a block.
 	 *
 	 * Blocks are recorded on the release meta as `release_block`, and cleared by
-	 * Plugin_Directory::add_release() with `unblock => true`.
+	 * Plugin_Directory::add_release() with `unblock => true`. A newly selected
+	 * burned ref is held out of `update_source`; one already served cannot be
+	 * unshipped, but the block prevents that ref from being served again.
 	 *
 	 * @param array|bool $release The release row from Plugin_Directory::get_release(), or false.
-	 * @return bool True when the release is being held out of `update_source`.
+	 * @return bool True when the release ref is burned.
 	 */
 	public static function is_release_blocked( $release ) {
 		return is_array( $release ) && ! empty( $release['release_block'] );
 	}
 
 	/**
-	 * Burn a plugin release ref until it's force-released.
+	 * Burn the exact scanned release ref until it is explicitly force-released.
 	 *
-	 * A later ref escapes the hold. An already-served ref cannot be unshipped,
-	 * but stays burned against reuse. Capability checks are the caller's.
+	 * A callback may arrive after a later candidate is imported, so the scanned
+	 * identity is supplied instead of reconstructed from current plugin meta. A
+	 * later ref remains eligible. An already-served ref cannot be recalled, but
+	 * burning it prevents that ref from being served again.
+	 *
+	 * Tagged refs remain burned even if their Version header changes. Trunk is
+	 * version-qualified because the same `trunk` ref is reused for later releases.
+	 * Capability checks are the caller's.
 	 *
 	 * @param string $plugin_slug The plugin slug.
 	 * @param string $version     The scanned plugin Version header.
 	 * @param string $release_ref The scanned stable tag, or `trunk`.
 	 * @param array  $block       The block to record; 'blocked_at' is added here.
-	 * @return bool Whether the ref is blocked as a result.
+	 * @return bool Whether the block exists and any required update API sync succeeded.
 	 */
 	public static function block_release( $plugin_slug, $version, $release_ref, array $block ) {
 		$post = Plugin_Directory::get_plugin_post( $plugin_slug );
@@ -311,25 +334,32 @@ class API_Update_Updater {
 		$current_ref     = get_post_meta( $post->ID, 'stable_tag', true );
 		$current_tag     = 'trunk' === $current_ref ? "trunk@{$current_version}" : $current_ref;
 
-		// Already held; recording a second block would merge it into the first.
-		if ( self::is_release_blocked( $release ) ) {
-			return $current_tag !== $release_tag || self::update_single_plugin( $plugin_slug );
+		/*
+		 * Preserve the first block's evidence. An already-blocked current ref still
+		 * reaches the synchronization below in case an earlier attempt recorded the
+		 * block but failed before reconciling `update_source`.
+		 */
+		if ( ! self::is_release_blocked( $release ) ) {
+			$block['blocked_at'] = time();
+
+			$recorded = Plugin_Directory::add_release(
+				$post,
+				array(
+					'tag'           => $release_tag,
+					'release_block' => $block,
+				)
+			);
+			if ( ! $recorded ) {
+				return false;
+			}
 		}
 
-		$block['blocked_at'] = time();
-
-		$recorded = Plugin_Directory::add_release(
-			$post,
-			array(
-				'tag'           => $release_tag,
-				'release_block' => $block,
-			)
-		);
-		if ( ! $recorded ) {
-			return false;
+		// A superseded ref is burned for future reuse without perturbing its replacement.
+		if ( $current_tag !== $release_tag ) {
+			return true;
 		}
 
-		return $current_tag !== $release_tag || self::update_single_plugin( $plugin_slug );
+		return self::update_single_plugin( $plugin_slug );
 	}
 
 	/**
@@ -420,11 +450,11 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * Determine the release timestamp for a plugin version.
+	 * Determine the timestamp for the selected release.
 	 *
 	 * Falls back through the commit timestamp on the plugin post, and is replaced by the
 	 * latest committer-confirmation time when release confirmations are required (the
-	 * version isn't really "released" until the last confirmation lands).
+	 * release is not eligible until the last confirmation lands).
 	 *
 	 * @param \WP_Post   $post    The plugin post.
 	 * @param array|bool $release The release row from Plugin_Directory::get_release(), or false.
@@ -446,7 +476,7 @@ class API_Update_Updater {
 
 	/**
 	 * Schedule a deferred release-to-update-api cron event for a plugin, replacing
-	 * any earlier event so a follow-up commit fully resets the cooldown window.
+	 * any prior event so only the current candidate is reconsidered at its deadline.
 	 *
 	 * @param string $plugin_slug    The plugin slug.
 	 * @param int    $cooldown_until Unix timestamp when the deferred event should fire.
@@ -457,9 +487,9 @@ class API_Update_Updater {
 	}
 
 	/**
-	 * Cron handler for `release_to_update_api:{slug}`. Fires when the cooldown
-	 * expires; writes the new version to `update_source` immediately. The slug
-	 * is recovered from the dynamic hook name so no args need flow through cron.
+	 * Cron handler for `release_to_update_api:{slug}`. Re-evaluates current plugin
+	 * state when the cooldown is due. The slug is recovered from the dynamic hook
+	 * name so stale candidate arguments do not flow through cron.
 	 */
 	public static function cron_trigger_release() {
 		list( , $plugin_slug ) = explode( ':', current_filter(), 2 );

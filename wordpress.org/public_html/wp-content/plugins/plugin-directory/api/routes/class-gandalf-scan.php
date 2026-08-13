@@ -217,6 +217,7 @@ class Gandalf_Scan extends Base {
 			return $error;
 		}
 
+		// Completed scores drive release policy; failed callbacks legitimately omit them.
 		if (
 			'completed' === $data['status'] &&
 			( ! isset( $data['max_risk_score'] ) || $data['max_risk_score'] < 0 || $data['max_risk_score'] > 10 )

@@ -16,13 +16,17 @@ class Plugin_Scan {
 	/**
 	 * Watch for plugin imports and queue a scan job if needed.
 	 *
+	 * The importer owns the candidate Version and stable tag; the update API
+	 * owns the release currently served to sites. Capture both before queueing
+	 * because cron may run after a later import has changed either source.
+	 *
 	 * @param \WP_Post $plugin           The plugin post.
 	 * @param string   $stable_tag       The new stable tag.
 	 * @param string   $old_stable_tag   The old stable tag.
 	 * @param array    $changed_svn_tags The SVN tags that were changed.
 	 * @param int      $svn_revision     The SVN revision number.
 	 * @param array    $warnings         The import warnings.
-	 * @param string   $version          The imported plugin Version header.
+	 * @param string   $version          The Version header read by this import.
 	 */
 	public static function wporg_plugins_imported( $plugin, $stable_tag, $old_stable_tag, $changed_svn_tags, $svn_revision, $warnings, $version ) {
 		$to_scan = [];
@@ -88,7 +92,8 @@ class Plugin_Scan {
 	 *
 	 * @param string     $plugin_slug    The plugin slug.
 	 * @param array      $to_scan        The tags to scan with PCP.
-	 * @param array|bool $import_context The importer release context, or false if absent.
+	 * @param array|bool $import_context Candidate and served identities captured at import,
+	 *                                   or false if absent.
 	 */
 	public static function cron_trigger( $plugin_slug, $to_scan, $import_context = false ) {
 		$plugin = Plugin_Directory::get_plugin_post( $plugin_slug );

@@ -18,7 +18,7 @@ use WP_Http;
  */
 class Plugin_Scan_Gandalf {
 
-	/** Pending scans keyed by scan_id, used to recognize callbacks. */
+	/** Frozen candidate identities keyed by scan ID for callback validation and blocking. */
 	const PENDING_META_KEY = '_gandalf_scan_pending';
 
 	/** Verdict hashes already sent to Slack, to avoid duplicate alerts. */
@@ -27,7 +27,7 @@ class Plugin_Scan_Gandalf {
 	/** Last dispatch or callback error for quick operator debugging. */
 	const LAST_ERROR_META_KEY = '_gandalf_scan_last_error';
 
-	/** Completed scans at or above this score burn their release ref. */
+	/** WordPress.org's inclusive policy threshold on Gandalf's 0-10 risk score. */
 	const BLOCK_RISK_SCORE = 8.0;
 
 	/** Gandalf scan endpoint. */
@@ -36,9 +36,17 @@ class Plugin_Scan_Gandalf {
 	/**
 	 * Dispatch a Gandalf scan from the importer context carried through cron.
 	 *
+	 * Candidate and served identities were captured before this delayed job was
+	 * queued. Do not replace them with current post meta or `update_source`:
+	 * either may now describe a later release.
+	 *
+	 * These snapshots freeze routing identity, not ZIP contents; the download
+	 * aliases can still be rebuilt independently of this job.
+	 *
 	 * @param \WP_Post $plugin         The plugin post.
 	 * @param array    $import_context The importer context.
 	 * @return bool Whether the request was accepted.
+	 * @throws \UnexpectedValueException When a queued import or served identity is malformed.
 	 */
 	public static function dispatch_from_import_context( $plugin, $import_context ) {
 		if ( ! defined( 'WP_GANDALF_SCAN_SHARED_SECRET' ) || ! WP_GANDALF_SCAN_SHARED_SECRET ) {
@@ -68,8 +76,16 @@ class Plugin_Scan_Gandalf {
 			return false;
 		}
 
-		$version              = $import_context['version'];
-		$served_release       = $import_context['served_release'];
+		$version        = $import_context['version'];
+		$served_release = $import_context['served_release'];
+
+		/*
+		 * A baseline must be the distinct, unblocked tag served when this job was
+		 * queued. Trunk and same-ref aliases cannot address a distinct baseline,
+		 * and a rewritten tag whose stored Version no longer matches the snapshot
+		 * is ambiguous. Leave all three previous fields null otherwise;
+		 * partial baseline context is invalid.
+		 */
 		$previous_release_ref = null;
 		$previous_version     = null;
 		$previous_zip_url     = null;
@@ -175,9 +191,12 @@ class Plugin_Scan_Gandalf {
 	/**
 	 * Handle a completed or failed scan callback.
 	 *
+	 * The pending record is the authoritative candidate identity; current plugin
+	 * metadata may have advanced while the scan ran.
+	 *
 	 * @param \WP_Post $plugin The plugin post.
 	 * @param array    $data   The Gandalf callback data.
-	 * @return true|WP_Error True on success, or an error when the scan is unknown.
+	 * @return true|WP_Error True on success, or a WP_Error when validation or blocking fails.
 	 */
 	public static function handle_callback( $plugin, $data ) {
 		$scan_id = $data['scan_id'];
@@ -198,6 +217,7 @@ class Plugin_Scan_Gandalf {
 		}
 
 		if ( 'completed' === $data['status'] ) {
+			// Burn the pending scan identity rather than reconstructing it from current plugin meta.
 			if (
 				$data['max_risk_score'] >= self::BLOCK_RISK_SCORE &&
 				! API_Update_Updater::block_release(
@@ -210,6 +230,7 @@ class Plugin_Scan_Gandalf {
 					)
 				)
 			) {
+				// Keep the pending record so a retried callback can retry the block operation.
 				$error = new WP_Error( 'security_scan_block_failed', 'The scanned release could not be blocked.', [ 'status' => WP_Http::INTERNAL_SERVER_ERROR ] );
 				self::record_invalid_callback( $plugin, $error, $scan_id );
 				return $error;
