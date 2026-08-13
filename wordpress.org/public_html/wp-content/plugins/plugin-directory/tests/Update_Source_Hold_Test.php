@@ -227,6 +227,11 @@ class Update_Source_Hold_Test extends TestCase {
 	 */
 	public function test_same_version_new_tag_is_deferred(): void {
 		global $wpdb;
+		$release                              = $this->get_release();
+		$release['confirmations_required']    = 1;
+		$release['confirmations']['reviewer'] = time() - 3 * DAY_IN_SECONDS;
+		update_post_meta( $this->plugin->ID, 'releases', array( $release ) );
+
 		update_post_meta( $this->plugin->ID, 'version_date', current_time( 'mysql' ) );
 		$this->insert_served_row( self::STAGED_VERSION );
 		$wpdb->update(

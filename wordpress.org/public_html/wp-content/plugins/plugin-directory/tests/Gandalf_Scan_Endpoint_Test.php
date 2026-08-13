@@ -256,6 +256,10 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 			)
 		);
 
+		// Import history may identify an unserved intermediate release; it is not the baseline.
+		update_post_meta( $this->plugin->ID, 'last_version', '2.6.5' );
+		update_post_meta( $this->plugin->ID, 'last_stable_tag', 'unserved-tag' );
+
 		$context         = null;
 		$schedule_filter = static function ( $pre, $event ) use ( &$context ) {
 			$context = $event->args[2];

@@ -584,7 +584,7 @@ class Import {
 		update_post_meta( $plugin->ID, 'tags',       wp_slash( $tagged_versions ) );
 
 		// Reconcile the imported identity with the update API; a cooldown or block
-		// may keep the previous release served.
+		// may keep the previous release recorded in `update_source`.
 		API_Update_Updater::update_single_plugin( $plugin->post_name );
 		Plugins_Info_API::flush_plugin_information_cache( $plugin->post_name );
 
@@ -594,7 +594,7 @@ class Import {
 		 * The parsed Version header is passed explicitly because consumers may
 		 * queue work that runs after plugin meta has advanced to a later import.
 		 * Update API reconciliation runs before this action, and its row remains the
-		 * source of truth for the release served at this import boundary.
+		 * source of truth for the update API identity at this import boundary.
 		 *
 		 * @param WP_Post $plugin         The plugin updated.
 		 * @param string  $stable_tag     The new stable tag for the plugin.

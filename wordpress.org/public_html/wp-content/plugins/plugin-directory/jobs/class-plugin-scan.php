@@ -16,9 +16,9 @@ class Plugin_Scan {
 	/**
 	 * Watch for plugin imports and queue a scan job if needed.
 	 *
-	 * The importer owns the candidate Version and stable tag; the update API
-	 * owns the release currently served to sites. Capture both before queueing
-	 * because cron may run after a later import has changed either source.
+	 * The importer owns the candidate Version and stable tag; `update_source`
+	 * owns the update API's recorded release identity. Capture both before
+	 * queueing because cron may run after a later import changes either source.
 	 *
 	 * @param \WP_Post $plugin           The plugin post.
 	 * @param string   $stable_tag       The new stable tag.

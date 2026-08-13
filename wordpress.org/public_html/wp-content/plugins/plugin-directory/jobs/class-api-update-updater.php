@@ -468,7 +468,7 @@ class API_Update_Updater {
 			$release['confirmations_required'] &&
 			$release['confirmations']
 		) {
-			$release_time = max( $release['confirmations'] );
+			$release_time = max( $release_time, max( $release['confirmations'] ) );
 		}
 
 		return $release_time;
