@@ -37,15 +37,78 @@ class Builder {
 	protected $plugins_revision = 0;
 
 	/**
+	 * UUIDv4 of the candidate being built outside the public namespace.
+	 *
+	 * @var string
+	 */
+	protected $stage_id = '';
+
+	/**
+	 * Exact importer export to package instead of exporting mutable SVN again.
+	 *
+	 * @var string
+	 */
+	protected $stage_source_dir = '';
+
+	/**
+	 * SVN revision of the importer export.
+	 *
+	 * @var int
+	 */
+	protected $stage_source_revision = 0;
+
+	/**
+	 * Manifest produced while staging one candidate.
+	 *
+	 * @var array
+	 */
+	protected $staged_candidate = array();
+
+	/**
+	 * Build one candidate without replacing its public ZIP.
+	 *
+	 * The source directory is the exact export the importer parsed, so release
+	 * metadata and staged bytes cannot come from different SVN snapshots.
+	 *
+	 * @param string $slug            The plugin slug.
+	 * @param string $release_ref     The effective stable tag, or trunk.
+	 * @param string $scan_id         The UUIDv4 identifying the Gandalf scan.
+	 * @param string $source_dir      The importer-owned stable export.
+	 * @param int    $source_revision The SVN revision of that export.
+	 * @param string $context         Optional SVN commit context.
+	 * @return array|false The staged artifact manifest, or false when ZIP SVN is unconfigured.
+	 * @throws Exception When the candidate cannot be staged.
+	 */
+	public function stage( $slug, $release_ref, $scan_id, $source_dir, $source_revision, $context = '' ) {
+		if ( ! wp_is_uuid( $scan_id, 4 ) || ! is_dir( $source_dir ) || $source_revision < 1 ) {
+			throw new Exception( __METHOD__ . ': Invalid staged candidate source.' );
+		}
+
+		$this->stage_id              = $scan_id;
+		$this->stage_source_dir      = $source_dir;
+		$this->stage_source_revision = (int) $source_revision;
+
+		$built = $this->build( $slug, array( $release_ref ), $context, $release_ref );
+		if ( false === $built ) {
+			return false;
+		}
+		if ( ! $this->staged_candidate ) {
+			throw new Exception( __METHOD__ . ': Candidate manifest was not created.' );
+		}
+
+		return $this->staged_candidate;
+	}
+
+	/**
 	 * Generate a ZIP for a provided Plugin tags.
 	 *
 	 * @param string $slug       The plugin slug.
 	 * @param array  $versions   The versions of the plugin to build ZIPs for.
-	 * @param string $context    Optional. The context of this Builder instance (commit #, etc). Default empty string.
-	 * @param string $stable_tag Optional. The stable tag of the plugin, used to determine whether checksums are generated. Default empty string.
+	 * @param string $context    The context of this Builder instance (commit #, etc).
+	 * @param string $stable_tag The stable tag, used for checksums and the public-build guard.
 	 * @return array|false Map of successfully-built version (as requested) => SVN revision it was built from, false in unconfigured environments.
 	 */
-	public function build( $slug, $versions, $context = '', $stable_tag = '' ) {
+	public function build( $slug, $versions, $context, $stable_tag ) {
 		// Bail when in an unconfigured environment.
 		if ( ! defined( 'PLUGIN_ZIP_SVN_URL' ) ) {
 			return false;
@@ -56,6 +119,10 @@ class Builder {
 		$this->context    = $context;
 		$this->stable_tag = $stable_tag;
 
+		if ( ! $this->stage_id ) {
+			$this->assert_public_build_allowed( $slug, $versions, $stable_tag );
+		}
+
 		// General TMP directory
 		if ( ! is_dir( self::TMP_DIR ) ) {
 			mkdir( self::TMP_DIR, 0777, true );
@@ -65,38 +132,7 @@ class Builder {
 		// Temp Directory for this instance of the Builder class.
 		$this->tmp_dir = $this->generate_temporary_directory( self::TMP_DIR, $slug );
 
-		// Create a checkout of the ZIP SVN
-		$res_checkout = SVN::checkout(
-			PLUGIN_ZIP_SVN_URL,
-			$this->tmp_dir,
-			array(
-				'depth'    => 'empty',
-				'username' => PLUGIN_ZIP_SVN_USER,
-				'password' => PLUGIN_ZIP_SVN_PASS,
-			)
-		);
-
-		if ( $res_checkout['result'] ) {
-
-			// Ensure the plugins folder exists within svn
-			$plugin_folder = "{$this->tmp_dir}/{$this->slug}/";
-
-			$res = SVN::up(
-				$plugin_folder,
-				array(
-					'depth' => 'empty',
-				)
-			);
-			if ( ! is_dir( $plugin_folder ) ) {
-				mkdir( $plugin_folder, 0777, true );
-				$res = SVN::add( $plugin_folder );
-			}
-			if ( ! $res['result'] ) {
-				throw new Exception( __METHOD__ . ": Failed to create {$plugin_folder}." );
-			}
-		} else {
-			throw new Exception( __METHOD__ . ': Failed to create checkout of ' . PLUGIN_ZIP_SVN_URL . '.' );
-		}
+		$this->prepare_checkout();
 
 		// Build the requested ZIPs
 		$built_versions = [];
@@ -135,6 +171,10 @@ class Builder {
 				$this->generate_zip_signatures();
 
 				$this->generate_checksums();
+
+				if ( $this->stage_id ) {
+					$this->stage_output_files( $requested_version );
+				}
 
 				$this->cleanup_plugin_tmp();
 
@@ -186,7 +226,9 @@ class Builder {
 			)
 		);
 
-		$this->invalidate_zip_caches( $versions );
+		if ( ! $this->stage_id ) {
+			$this->invalidate_zip_caches( $versions );
+		}
 
 		$this->cleanup();
 
@@ -201,6 +243,225 @@ class Builder {
 		 */
 
 		return $built_versions;
+	}
+
+	/**
+	 * Keep selected and pending release refs out of the direct public builder.
+	 *
+	 * @param string $slug       The plugin slug.
+	 * @param array  $versions   Requested refs.
+	 * @param string $stable_tag The currently selected stable ref.
+	 * @throws Exception When a requested ref must use the promotion gate.
+	 */
+	protected function assert_public_build_allowed( $slug, $versions, $stable_tag ) {
+		$normalize = static function ( $version ) {
+			return '.' === substr( $version, 0, 1 ) ? "0{$version}" : $version;
+		};
+		$versions = array_map( $normalize, $versions );
+		$plugin    = \WordPressdotorg\Plugin_Directory\Plugin_Directory::get_plugin_post( $slug );
+		$candidate = $plugin ? get_post_meta( $plugin->ID, '_gandalf_release_candidate', true ) : false;
+		$protected = array( $stable_tag );
+		if ( is_array( $candidate ) && is_string( $candidate['release_ref'] ?? null ) ) {
+			$protected[] = $candidate['release_ref'];
+		}
+		$protected = array_map( $normalize, $protected );
+		if ( array_intersect( $protected, $versions ) ) {
+			throw new Exception( __METHOD__ . ': A selected release ZIP must use stage() and promote().' );
+		}
+	}
+
+	/**
+	 * Promote the exact staged bundle to its conventional public filenames.
+	 *
+	 * @param string $slug      The plugin slug.
+	 * @param string $scan_id   The UUIDv4 whose exact staged bundle was approved.
+	 * @param array  $candidate The manifest returned by stage().
+	 * @param string $context   Optional SVN commit context.
+	 * @return bool Whether the exact bundle was promoted.
+	 * @throws Exception When custody validation or the SVN commit fails.
+	 */
+	public function promote( $slug, $scan_id, $candidate, $context = '' ) {
+		if ( ! defined( 'PLUGIN_ZIP_SVN_URL' ) ) {
+			return false;
+		}
+		$files = $this->validate_promotion_manifest( $slug, $scan_id, $candidate );
+
+		$this->slug    = $slug;
+		$this->context = $context;
+		if ( ! is_dir( self::TMP_DIR ) ) {
+			mkdir( self::TMP_DIR, 0777, true );
+			chmod( self::TMP_DIR, 0777 );
+		}
+		$this->tmp_dir = $this->generate_temporary_directory( self::TMP_DIR, $slug );
+
+		try {
+			$this->prepare_checkout();
+
+			foreach ( $files as $file ) {
+				$staged_path = "{$this->tmp_dir}/{$slug}/{$file['staged']}";
+				$public_path = "{$this->tmp_dir}/{$slug}/{$file['public']}";
+
+				SVN::up( $staged_path );
+				if ( ! is_file( $staged_path ) || hash_file( 'sha256', $staged_path ) !== $file['sha256'] ) {
+					throw new Exception( __METHOD__ . ": Staged artifact {$file['staged']} does not match its manifest." );
+				}
+
+				SVN::up( $public_path );
+				if ( ! copy( $staged_path, $public_path ) || hash_file( 'sha256', $public_path ) !== $file['sha256'] ) {
+					throw new Exception( __METHOD__ . ": Failed to copy {$file['staged']} to {$file['public']}." );
+				}
+				SVN::add( $public_path );
+			}
+			$result = SVN::commit(
+				"{$this->tmp_dir}/{$slug}",
+				$this->context ? $this->context : "Promoted Gandalf-approved ZIP for {$slug}.",
+				array(
+					'username' => PLUGIN_ZIP_SVN_USER,
+					'password' => PLUGIN_ZIP_SVN_PASS,
+				)
+			);
+			if ( ! $result['result'] && $result['errors'] ) {
+				// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- CLI context, callers write the message to STDERR.
+				throw new Exception( __METHOD__ . ': Failed to promote the staged ZIP: ' . $result['errors'][0]['error_message'] );
+			}
+		} finally {
+			$this->cleanup();
+		}
+
+		$this->slug = $slug;
+		$this->invalidate_zip_caches( array( $candidate['release_ref'] ) );
+		return true;
+	}
+
+	/**
+	 * Validate that a manifest names one scan's exact approved ZIP bundle.
+	 *
+	 * @param string $slug      The plugin slug.
+	 * @param string $scan_id   The UUIDv4 whose bundle was approved.
+	 * @param array  $candidate The staged artifact manifest.
+	 * @return array Validated file entries.
+	 * @throws Exception When the manifest is malformed or names another ZIP.
+	 */
+	protected function validate_promotion_manifest( $slug, $scan_id, $candidate ) {
+		if (
+			! preg_match( '/^[a-z0-9][a-z0-9-]*$/', $slug ) ||
+			! wp_is_uuid( $scan_id, 4 ) ||
+			empty( $candidate['files'] ) ||
+			! is_array( $candidate['files'] ) ||
+			! preg_match( '/^[a-f0-9]{64}$/', $candidate['current_zip_sha256'] ?? '' )
+		) {
+			throw new Exception( __METHOD__ . ': Invalid candidate manifest.' );
+		}
+
+		$zip_digest = false;
+		foreach ( $candidate['files'] as $file ) {
+			if (
+				! is_array( $file ) ||
+				empty( $file['staged'] ) ||
+				empty( $file['public'] ) ||
+				empty( $file['sha256'] ) ||
+				basename( $file['staged'] ) !== $file['staged'] ||
+				basename( $file['public'] ) !== $file['public'] ||
+				! preg_match( '/^[a-f0-9]{64}$/', $file['sha256'] ) ||
+				! str_starts_with( $file['staged'], "{$slug}.gandalf-{$scan_id}." ) ||
+				! str_starts_with( $file['public'], "{$slug}." )
+			) {
+				throw new Exception( __METHOD__ . ': Invalid candidate file entry.' );
+			}
+			if ( "{$slug}.gandalf-{$scan_id}.zip" === $file['staged'] ) {
+				$zip_digest = $file['sha256'];
+			}
+		}
+
+		if ( false === $zip_digest || ! hash_equals( $candidate['current_zip_sha256'], $zip_digest ) ) {
+			throw new Exception( __METHOD__ . ': Approved ZIP digest does not match the promoted bundle.' );
+		}
+
+		return $candidate['files'];
+	}
+
+	/**
+	 * Rename generated output to write-once staged filenames and record hashes.
+	 *
+	 * @param string $release_ref The requested plugin SVN ref.
+	 * @throws Exception When a staged file cannot be created or hashed.
+	 */
+	protected function stage_output_files( $release_ref ) {
+		$stage_prefix = "{$this->tmp_dir}/{$this->slug}/{$this->slug}.gandalf-{$this->stage_id}";
+		$outputs      = array( array( $this->zip_file, "{$stage_prefix}.zip" ) );
+
+		if ( $this->checksum_file ) {
+			$outputs[] = array( $this->checksum_file, "{$stage_prefix}.checksums.json" );
+		}
+		if ( $this->signature_file ) {
+			$outputs[] = array( $this->signature_file, "{$stage_prefix}.zip.sig" );
+		}
+
+		$files = array();
+		foreach ( $outputs as list( $public_path, $staged_path ) ) {
+			if ( file_exists( $staged_path ) || ! rename( $public_path, $staged_path ) ) {
+				throw new Exception( __METHOD__ . ': Failed to create a staged artifact.' );
+			}
+
+			$sha256 = hash_file( 'sha256', $staged_path );
+			if ( ! $sha256 ) {
+				throw new Exception( __METHOD__ . ': Failed to hash a staged artifact.' );
+			}
+
+			$files[] = array(
+				'staged' => basename( $staged_path ),
+				'public' => basename( $public_path ),
+				'sha256' => $sha256,
+			);
+
+			if ( $public_path === $this->zip_file ) {
+				$this->zip_file = $staged_path;
+			} elseif ( $public_path === $this->checksum_file ) {
+				$this->checksum_file = $staged_path;
+			} else {
+				$this->signature_file = $staged_path;
+			}
+		}
+
+		$this->staged_candidate = array(
+			'release_ref'        => (string) $release_ref,
+			'source_revision'    => $this->stage_source_revision,
+			'current_zip_url'    => Serve::staged_download_url( $this->slug, $this->stage_id ),
+			'current_zip_sha256' => $files[0]['sha256'],
+			'files'              => $files,
+		);
+	}
+
+	/**
+	 * Prepare a sparse checkout of this plugin's ZIP-SVN directory.
+	 *
+	 * @throws Exception When the checkout cannot be prepared.
+	 */
+	protected function prepare_checkout() {
+		$checkout = SVN::checkout(
+			PLUGIN_ZIP_SVN_URL,
+			$this->tmp_dir,
+			array(
+				'depth'    => 'empty',
+				'username' => PLUGIN_ZIP_SVN_USER,
+				'password' => PLUGIN_ZIP_SVN_PASS,
+			)
+		);
+		if ( ! $checkout['result'] ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Internal ZIP-store invariant.
+			throw new Exception( __METHOD__ . ': Failed to create checkout of ' . PLUGIN_ZIP_SVN_URL . '.' );
+		}
+
+		$plugin_folder = "{$this->tmp_dir}/{$this->slug}/";
+		$result        = SVN::up( $plugin_folder, array( 'depth' => 'empty' ) );
+		if ( ! is_dir( $plugin_folder ) ) {
+			mkdir( $plugin_folder, 0777, true );
+			$result = SVN::add( $plugin_folder );
+		}
+		if ( ! $result['result'] ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Internal ZIP-store invariant.
+			throw new Exception( __METHOD__ . ": Failed to create {$plugin_folder}." );
+		}
 	}
 
 	/**
@@ -395,6 +656,48 @@ class Builder {
 		}
 
 		$build_dir = "{$this->tmp_build_dir}/{$this->slug}/";
+		if ( $this->stage_source_dir ) {
+			mkdir( $build_dir, 0777, true );
+			$this->exec(
+				sprintf(
+					'cp -a %s/. %s',
+					escapeshellarg( rtrim( $this->stage_source_dir, '/' ) ),
+					escapeshellarg( $build_dir )
+				),
+				$output,
+				$status
+			);
+			if ( $status ) {
+				throw new Exception( __METHOD__ . ': Failed to copy the importer export.' );
+			}
+			$this->plugins_revision = $this->stage_source_revision;
+		} else {
+			$this->export_plugin_from_svn( $build_dir );
+		}
+
+		// Verify that the specified plugin zip will contain files.
+		if ( ! array_diff( scandir( $this->tmp_build_dir ), array( '.', '..' ) ) ) {
+			throw new Exception( __METHOD__ . ': No files exist in the plugin directory', 404 );
+		}
+
+		// Cleanup any symlinks that shouldn't be there.
+		$this->exec(
+			sprintf(
+				'find %s -type l -print0 | xargs -r0 rm',
+				escapeshellarg( $build_dir )
+			)
+		);
+
+		return true;
+	}
+
+	/**
+	 * Export the selected ref when building a legacy public ZIP directly.
+	 *
+	 * @param string $build_dir Destination directory.
+	 * @throws Exception When SVN export fails.
+	 */
+	protected function export_plugin_from_svn( $build_dir ) {
 
 		$svn_params = array();
 		// BudyPress is a special sister project, they have svn:externals.
@@ -429,19 +732,6 @@ class Builder {
 
 		// Store the SVN revision that's been used for the ZIP in a property for later.
 		$this->plugins_revision = $res['revision'];
-
-		// Verify that the specified plugin zip will contain files.
-		if ( ! array_diff( scandir( $this->tmp_build_dir ), array( '.', '..' ) ) ) {
-			throw new Exception( __METHOD__ . ': No files exist in the plugin directory', 404 );
-		}
-
-		// Cleanup any symlinks that shouldn't be there
-		$this->exec( sprintf(
-			'find %s -type l -print0 | xargs -r0 rm',
-			escapeshellarg( $build_dir )
-		) );
-
-		return true;
 	}
 
 	/**
@@ -582,4 +872,3 @@ class Builder {
 	}
 
 }
-

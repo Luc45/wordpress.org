@@ -109,6 +109,25 @@ try {
 		$stable_tag = 'trunk';
 	}
 
+	if ( in_array( $stable_tag, $versions, true ) ) {
+		Jobs\Plugin_Import::queue(
+			$plugin_slug,
+			array(
+				'tags_touched'  => array( $stable_tag ),
+				'tags_deleted'  => array(),
+				'revisions'     => array( 0 ),
+				'readme_touched' => true,
+				'code_touched'   => true,
+				'assets_touched' => true,
+			)
+		);
+		$versions = array_values( array_diff( $versions, array( $stable_tag ) ) );
+		if ( ! $versions ) {
+			echo "Queued current stable ZIP for Gandalf promotion.\n";
+			exit( 0 );
+		}
+	}
+
 	// (re)Build & Commit 5 Zips at a time to avoid limitations.
 	foreach ( array_chunk( $versions, 5 ) as $versions_to_build ) {
 		$built_versions = $zip_builder->build(

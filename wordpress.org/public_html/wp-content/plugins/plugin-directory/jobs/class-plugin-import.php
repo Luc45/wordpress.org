@@ -20,9 +20,19 @@ class Plugin_Import {
 	 *
 	 * @param string $plugin_slug The plugin slug.
 	 * @param array  $plugin_data Data about the SVN change (tags_touched, revisions, etc).
+	 * @throws \RuntimeException When the event cannot be scheduled.
 	 */
 	public static function queue( $plugin_slug, $plugin_data ) {
 		$new_args = array_merge( array( 'plugin' => $plugin_slug ), $plugin_data );
+		$hook     = "import_plugin:{$plugin_slug}";
+
+		if ( self::is_promotion_payload( $new_args ) ) {
+			foreach ( Manager::get_scheduled_events( $hook ) as $event ) {
+				if ( array( $new_args ) === $event['args'] ) {
+					return;
+				}
+			}
+		}
 
 		/*
 		 * If there's already a future-scheduled import for this plugin and nothing
@@ -43,20 +53,22 @@ class Plugin_Import {
 		 * transition. 5s assumes the status read at the top of this function
 		 * is still fresh by the time `update_scheduled_event` writes.
 		 */
-		$next_scheduled = Manager::get_scheduled_time( "import_plugin:{$plugin_slug}", 'next' );
+		$next_scheduled = Manager::get_scheduled_time( $hook, 'next' );
+		$next_events    = $next_scheduled ? Manager::get_scheduled_events( $hook, $next_scheduled ) : array();
+		$existing_args  = $next_events[0]['args'][0] ?? array();
 		if (
 			$next_scheduled &&
 			$next_scheduled > time() + 5 &&
-			! Manager::is_event_running( "import_plugin:{$plugin_slug}" )
+			! self::is_promotion_payload( $new_args ) &&
+			! self::is_promotion_payload( $existing_args ) &&
+			! Manager::is_event_running( $hook )
 		) {
-			$existing      = Manager::get_scheduled_events( "import_plugin:{$plugin_slug}", $next_scheduled );
-			$existing_args = $existing[0]['args'][0] ?? array();
-			$merged_args   = self::merge_plugin_data( $existing_args, $new_args );
+			$merged_args = self::merge_plugin_data( $existing_args, $new_args );
 
 			list( $nextrun, $natural_reason ) = self::queue_run_time( $plugin_slug, $merged_args );
 
 			$updated = Manager::update_scheduled_event(
-				"import_plugin:{$plugin_slug}",
+				$hook,
 				$next_scheduled,
 				array(
 					'nextrun' => $nextrun,
@@ -82,20 +94,28 @@ class Plugin_Import {
 		list( $when_to_run, $reason ) = self::queue_run_time( $plugin_slug, $new_args );
 
 		// To avoid a situation where two imports run concurrently, if one is already scheduled or in flight, run it 1hr later (we'll trigger it after the current one finishes).
-		$last_scheduled = Manager::get_scheduled_time( "import_plugin:{$plugin_slug}", 'last' );
+		$last_scheduled = Manager::get_scheduled_time( $hook, 'last' );
 		if ( $last_scheduled ) {
 			$when_to_run = $last_scheduled + HOUR_IN_SECONDS;
 			$reason      = 'concurrency push: 1hr after pending event';
-		} elseif ( Manager::is_event_running( "import_plugin:{$plugin_slug}" ) ) {
+		} elseif ( Manager::is_event_running( $hook ) ) {
 			$when_to_run = time() + HOUR_IN_SECONDS;
 			$reason      = 'concurrency push: 1hr (import in flight)';
 		}
 
-		wp_schedule_single_event(
+		$scheduled = wp_schedule_single_event(
 			$when_to_run,
-			"import_plugin:{$plugin_slug}",
-			array( $new_args )
+			$hook,
+			array( $new_args ),
+			true
 		);
+		if ( is_wp_error( $scheduled ) && 'duplicate_event' === $scheduled->get_error_code() ) {
+			return;
+		}
+		if ( false === $scheduled || is_wp_error( $scheduled ) ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Internal scheduler invariant.
+			throw new \RuntimeException( "Could not schedule plugin import for {$plugin_slug}." );
+		}
 
 		if ( defined( 'STDERR' ) ) {
 			$log_line = sprintf(
@@ -239,35 +259,52 @@ class Plugin_Import {
 	}
 
 	/**
+	 * Whether a job contains exactly one Gandalf promotion request.
+	 *
+	 * @param array $plugin_data The scheduled job payload.
+	 * @return bool
+	 */
+	protected static function is_promotion_payload( array $plugin_data ) {
+		return 2 === count( $plugin_data )
+			&& isset( $plugin_data['plugin'], $plugin_data['gandalf_promotion'] )
+			&& is_string( $plugin_data['plugin'] )
+			&& is_string( $plugin_data['gandalf_promotion'] );
+	}
+
+	/**
 	 * The cron trigger for the import job.
 	 */
 	public static function cron_trigger( $plugin_data ) {
-		$plugin_slug  = $plugin_data['plugin'];
+		$plugin_slug = $plugin_data['plugin'];
 
-		// Set some default values if not included from the caller.
-		$plugin_data['tags_touched']   ??= array( 'trunk' );
-		$plugin_data['tags_deleted']   ??= array();
-		$plugin_data['revisions']      ??= [ 0 ];
-		$plugin_data['readme_touched'] ??= true;
-		$plugin_data['code_touched']   ??= true;
-		$plugin_data['assets_touched'] ??= true;
+		if ( self::is_promotion_payload( $plugin_data ) ) {
+			Plugin_Scan_Gandalf::cron_promote( $plugin_slug, $plugin_data['gandalf_promotion'] );
+		} else {
+			// Set some default values if not included from the caller.
+			$plugin_data['tags_touched']   ??= array( 'trunk' );
+			$plugin_data['tags_deleted']   ??= array();
+			$plugin_data['revisions']      ??= [ 0 ];
+			$plugin_data['readme_touched'] ??= true;
+			$plugin_data['code_touched']   ??= true;
+			$plugin_data['assets_touched'] ??= true;
 
-		$tags_touched = $plugin_data['tags_touched'];
-		$tags_deleted = $plugin_data['tags_deleted'];
-		$revision     = max( (array) $plugin_data['revisions'] );
+			$tags_touched = $plugin_data['tags_touched'];
+			$tags_deleted = $plugin_data['tags_deleted'];
+			$revision     = max( (array) $plugin_data['revisions'] );
 
-		$importer = new CLI\Import();
-		try {
-			$importer->import_from_svn( $plugin_slug, $tags_touched, $tags_deleted, $revision );
+			$importer = new CLI\Import();
+			try {
+				$importer->import_from_svn( $plugin_slug, $tags_touched, $tags_deleted, $revision );
 
-			// Schedule a job to import any i18n changes from this commit
-			Plugin_i18n_Import::queue( $plugin_slug, $plugin_data );
-		} catch ( Exception $e ) {
-			fwrite( STDERR, "[{$plugin_slug}] Plugin Import Failed: " . $e->getMessage() . "\n" );
-		} finally {
-			if ( $importer->plugin ) {
-				update_post_meta( $importer->plugin->ID, '_last_import', time() );
-				update_post_meta( $importer->plugin->ID, '_import_warnings', $importer->warnings );
+					// Schedule a job to import any i18n changes from this commit.
+				Plugin_i18n_Import::queue( $plugin_slug, $plugin_data );
+			} catch ( Exception $e ) {
+				fwrite( STDERR, "[{$plugin_slug}] Plugin Import Failed: " . $e->getMessage() . "\n" );
+			} finally {
+				if ( $importer->plugin ) {
+					update_post_meta( $importer->plugin->ID, '_last_import', time() );
+					update_post_meta( $importer->plugin->ID, '_import_warnings', $importer->warnings );
+				}
 			}
 		}
 

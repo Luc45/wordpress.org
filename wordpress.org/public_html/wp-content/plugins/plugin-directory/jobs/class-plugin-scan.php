@@ -46,17 +46,27 @@ class Plugin_Scan {
 
 		$to_scan = array_unique( $to_scan );
 
-		self::queue(
-			$plugin->post_name,
-			$to_scan,
-			[
-				'stable_tag'       => $stable_tag,
-				'old_stable_tag'   => $old_stable_tag,
-				'changed_svn_tags' => array_values( array_map( 'strval', (array) $changed_svn_tags ) ),
-				'svn_revision'     => (int) $svn_revision,
-				'warnings'         => is_array( $warnings ) ? $warnings : [],
-			]
-		);
+		self::queue( $plugin->post_name, $to_scan );
+	}
+
+	/**
+	 * Queue the staged stable ZIP for Gandalf without exposing it publicly.
+	 *
+	 * The scan ID only selects the authoritative candidate stored on the plugin;
+	 * the cron payload never carries a second, stale copy of release state.
+	 *
+	 * @param \WP_Post $plugin  The plugin post.
+	 * @param string   $scan_id The staged candidate UUIDv4.
+	 */
+	public static function queue_gandalf_candidate( $plugin, $scan_id ) {
+		$event_args = [ $plugin->post_name, [], [ 'gandalf_scan_id' => $scan_id ] ];
+		foreach ( Manager::get_scheduled_events( "scan_plugin:{$plugin->post_name}" ) as $event ) {
+			if ( $event_args === $event['args'] ) {
+				return;
+			}
+		}
+
+		self::queue( $plugin->post_name, [], [ 'gandalf_scan_id' => $scan_id ] );
 	}
 
 	/**
@@ -64,19 +74,33 @@ class Plugin_Scan {
 	 *
 	 * @param string $plugin_slug The plugin slug.
 	 * @param array  $args        The data to pass to the job.
+	 * @throws \RuntimeException When the event cannot be scheduled.
 	 */
 	public static function queue( $plugin_slug, ...$args ) {
+		$hook       = "scan_plugin:{$plugin_slug}";
+		$event_args = array_merge( [ $plugin_slug ], $args );
 		// To avoid a situation where two imports run concurrently, if one is already scheduled, run it 1hr later (We'll trigger it after the current one finishes).
 		$when_to_run = time() + 5;
-		if ( $next_scheduled = Manager::get_scheduled_time( "scan_plugin:{$plugin_slug}", 'last' ) ) {
+		$next_scheduled = Manager::get_scheduled_time( $hook, 'last' );
+		if ( $next_scheduled ) {
 			$when_to_run = $next_scheduled + HOUR_IN_SECONDS;
+		} elseif ( Manager::is_event_running( $hook ) ) {
+			$when_to_run = time() + HOUR_IN_SECONDS;
 		}
 
-		wp_schedule_single_event(
+		$scheduled = wp_schedule_single_event(
 			$when_to_run,
-			"scan_plugin:{$plugin_slug}",
-			array_merge( [ $plugin_slug ], $args ),
+			$hook,
+			$event_args,
+			true
 		);
+		if ( is_wp_error( $scheduled ) && 'duplicate_event' === $scheduled->get_error_code() ) {
+			return;
+		}
+		if ( false === $scheduled || is_wp_error( $scheduled ) ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Internal scheduler invariant.
+			throw new \RuntimeException( "Could not schedule plugin scan for {$plugin_slug}." );
+		}
 	}
 
 	/**
@@ -89,8 +113,11 @@ class Plugin_Scan {
 	public static function cron_trigger( $plugin_slug, $to_scan, $import_context = false ) {
 		$plugin = Plugin_Directory::get_plugin_post( $plugin_slug );
 
-		if ( $import_context ) {
-			Plugin_Scan_Gandalf::dispatch_from_import_context( $plugin, $import_context );
+		if ( is_array( $import_context ) && ! empty( $import_context['gandalf_scan_id'] ) ) {
+			$scan_id = $import_context['gandalf_scan_id'];
+			if ( ! Plugin_Scan_Gandalf::dispatch_candidate( $plugin, $scan_id ) ) {
+				self::queue_gandalf_candidate( $plugin, $scan_id );
+			}
 		}
 
 		$already_notified     = get_post_meta( $plugin->ID, '_scan_notified', true ) ?: [];

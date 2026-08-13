@@ -3,6 +3,8 @@ namespace WordPressdotorg\Plugin_Directory\CLI;
 
 use Exception;
 use WordPressdotorg\Plugin_Directory\Jobs\API_Update_Updater;
+use WordPressdotorg\Plugin_Directory\Jobs\Plugin_Import;
+use WordPressdotorg\Plugin_Directory\Jobs\Plugin_Scan;
 use WordPressdotorg\Plugin_Directory\Block_JSON;
 use WordPressdotorg\Plugin_Directory\Plugin_Directory;
 use WordPressdotorg\Plugin_Directory\Email\Release_Confirmation as Release_Confirmation_Email;
@@ -73,6 +75,7 @@ class Import {
 	 * Process an import for a Plugin into the Plugin Directory.
 	 *
 	 * @throws \Exception
+	 * @throws \UnexpectedValueException When the staged candidate cannot be persisted.
 	 *
 	 * @param string $plugin_slug            The slug of the plugin to import.
 	 * @param array  $svn_changed_tags       A list of tags/trunk which the SVN change touched. Optional.
@@ -97,13 +100,40 @@ class Import {
 		$stable_tag         = $data['stable_tag'];
 		$last_committer     = $data['last_committer'];
 		$last_revision      = $data['last_revision'];
+		$export_revision    = $data['export_revision'];
 		$tagged_versions    = $data['tagged_versions'];
 		$last_modified      = $data['last_modified'];
 		$blocks             = $data['blocks'];
 		$block_files        = $data['block_files'];
 		$dashboard_widgets  = $data['dashboard_widgets'] ?? array();
-		$current_stable_tag = get_post_meta( $plugin->ID, 'stable_tag', true ) ?: 'trunk';
-		$touches_stable_tag = (bool) array_intersect( [ $stable_tag, $current_stable_tag ], $svn_changed_tags );
+		if ( '' === $version ) {
+			throw new Exception( 'Plugin release is missing a Version header.' );
+		}
+		$normalize_ref          = static function ( $ref ) {
+			return '.' === substr( $ref, 0, 1 ) ? "0{$ref}" : $ref;
+		};
+		$changed_stable_refs    = array_map( $normalize_ref, $svn_changed_tags );
+		$current_stable_tag     = get_post_meta( $plugin->ID, 'stable_tag', true ) ?: 'trunk';
+		$touches_stable_tag     = (bool) array_intersect( [ $stable_tag, $current_stable_tag ], $changed_stable_refs );
+		$current_candidate      = get_post_meta( $plugin->ID, '_gandalf_release_candidate', true );
+		$has_public_release     = in_array( $plugin->post_status, [ 'publish', 'disabled', 'closed' ], true ) &&
+			'' !== (string) $plugin->version;
+		$candidate_matches_source = is_array( $current_candidate ) &&
+			in_array( $current_candidate['state'] ?? '', array( 'pending', 'scanning', 'deciding', 'approved' ), true ) &&
+			! $touches_stable_tag &&
+			( $current_candidate['version'] ?? null ) === $version &&
+			( $current_candidate['release_ref'] ?? null ) === $stable_tag;
+		$stage_stable_zip       = ! $candidate_matches_source && (
+			! $has_public_release ||
+			$version !== (string) $plugin->version ||
+			$stable_tag !== $current_stable_tag ||
+			$touches_stable_tag
+		);
+		$defer_public_release   = $candidate_matches_source || $stage_stable_zip;
+
+		if ( is_array( $current_candidate ) && ! $defer_public_release ) {
+			delete_post_meta( $plugin->ID, '_gandalf_release_candidate', wp_slash( $current_candidate ) );
+		}
 
 		// If the readme generated any warnings, raise it to self::$import_warnings;
 		if ( $readme->warnings ) {
@@ -394,7 +424,7 @@ class Import {
 		// Plugins should move from 'approved' to 'publish' on first parse
 		// `export_and_parse_plugin()` will throw an exception in the case where plugin files cannot be found,
 		// so by this time the plugin should be live.
-		if ( 'approved' === $plugin->post_status ) {
+		if ( ! $defer_public_release && 'approved' === $plugin->post_status ) {
 			$plugin->post_status = 'publish';
 
 			// The post date should be set to when the plugin is first set live.
@@ -470,12 +500,16 @@ class Import {
 		update_post_meta( $plugin->ID, 'requires',           wp_slash( $requires ) );
 		update_post_meta( $plugin->ID, 'requires_php',       wp_slash( $requires_php ) );
 		update_post_meta( $plugin->ID, 'tested',             wp_slash( $tested ) );
-		update_post_meta( $plugin->ID, 'tagged_versions',    wp_slash( array_keys( $tagged_versions ) ) );
+		if ( ! $defer_public_release ) {
+			update_post_meta( $plugin->ID, 'tagged_versions', wp_slash( array_keys( $tagged_versions ) ) );
+		}
 		update_post_meta( $plugin->ID, 'sections',           wp_slash( array_keys( $readme->sections ) ) );
 		update_post_meta( $plugin->ID, 'assets_screenshots', wp_slash( $assets['screenshot'] ) );
 		update_post_meta( $plugin->ID, 'assets_icons',       wp_slash( $assets['icon'] ) );
 		update_post_meta( $plugin->ID, 'assets_banners',     wp_slash( $assets['banner'] ) );
-		update_post_meta( $plugin->ID, 'last_updated',       wp_slash( $plugin->post_modified_gmt ) );
+		if ( ! $defer_public_release ) {
+			update_post_meta( $plugin->ID, 'last_updated', wp_slash( $plugin->post_modified_gmt ) );
+		}
 
 		// Calculate the 'plugin color' from the average color of the banner if provided. This is used for fallback icons.
 		$banner_average_color = '';
@@ -540,26 +574,83 @@ class Import {
 			Plugin_Directory::add_release(
 				$plugin,
 				[
-					'tag'       => $stable_tag,
-					'version'   => $version,
-					'committer' => [ $last_committer ],
-					'revision'  => [ $last_revision ]
+					'tag'        => $stable_tag,
+					'version'    => $version,
+					'committer'  => [ $last_committer ],
+					'revision'   => [ $last_revision ],
+					'zips_built' => ! $defer_public_release,
 				]
 			);
-		} elseif ( 'trunk' === $stable_tag && version_compare( $version, $plugin->version, '>' ) ) {
+		} elseif ( 'trunk' === $stable_tag && ( $stage_stable_zip || version_compare( $version, $plugin->version, '>' ) ) ) {
 			// This is a new version, released from trunk.
 			Plugin_Directory::add_release(
 				$plugin,
 				[
-					'tag'       => "trunk@{$version}",
-					'version'   => $version,
-					'committer' => [ $last_committer ],
-					'revision'  => [ $last_revision ]
+					'tag'        => "trunk@{$version}",
+					'version'    => $version,
+					'committer'  => [ $last_committer ],
+					'revision'   => [ $last_revision ],
+					'zips_built' => ! $defer_public_release,
 				]
 			);
 		}
 
-		$this->rebuild_affected_zips( $plugin_slug, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered );
+		$this->rebuild_affected_zips(
+			$plugin_slug,
+			$stable_tag,
+			$current_stable_tag,
+			$svn_changed_tags,
+			$svn_revision_triggered,
+			$defer_public_release ? array_unique( [ $stable_tag, $current_stable_tag, $current_candidate['release_ref'] ?? '' ] ) : []
+		);
+
+		if ( $candidate_matches_source ) {
+			if ( 'pending' === $current_candidate['state'] ) {
+				Plugin_Scan::queue_gandalf_candidate( $plugin, $current_candidate['scan_id'] );
+			} elseif ( 'approved' === $current_candidate['state'] ) {
+				Plugin_Import::queue( $plugin_slug, array( 'gandalf_promotion' => $current_candidate['scan_id'] ) );
+			}
+			return true;
+		}
+
+		if ( $stage_stable_zip ) {
+			$scan_id  = wp_generate_uuid4();
+			$artifact = ( new Builder() )->stage(
+				$plugin_slug,
+				$stable_tag,
+				$scan_id,
+				$data['tmp_dir'] . '/export',
+				$export_revision,
+				"{$plugin_slug}: staged from plugin SVN r{$export_revision}"
+			);
+			if ( ! $artifact ) {
+				throw new Exception( 'Plugin ZIP staging is not configured.' );
+			}
+
+			$candidate = [
+				'scan_id'            => $scan_id,
+				'version'            => (string) $version,
+				'release_ref'        => (string) $stable_tag,
+				'artifact'           => $artifact,
+				'public_version'     => $has_public_release ? (string) $plugin->version : null,
+				'public_release_ref' => $has_public_release ? (string) $current_stable_tag : null,
+				'public_zip_url'     => $has_public_release ? Template::download_link( $plugin, $current_stable_tag ) : null,
+				'state'              => 'pending',
+				'requested_at'       => time(),
+				'tags'               => $tagged_versions,
+				'last_updated'       => (string) $plugin->post_modified_gmt,
+				'changed_svn_tags'   => array_values( (array) $svn_changed_tags ),
+				'svn_revision'       => (int) $svn_revision_triggered,
+				'warnings'           => $this->warnings,
+			];
+
+			update_post_meta( $plugin->ID, '_gandalf_release_candidate', wp_slash( $candidate ) );
+			if ( get_post_meta( $plugin->ID, '_gandalf_release_candidate', true ) !== $candidate ) {
+				throw new \UnexpectedValueException( 'The staged Gandalf candidate could not be stored.' );
+			}
+			Plugin_Scan::queue_gandalf_candidate( $plugin, $scan_id );
+			return true;
+		}
 
 		// If we've got a new version, store the last version in the plugin meta.
 		if ( $version && $version !== $plugin->version ) {
@@ -597,6 +688,101 @@ class Import {
 	}
 
 	/**
+	 * Publish the exact staged release whose Gandalf callback was approved.
+	 *
+	 * The canonical ZIP is committed before this method runs. Public pointers are
+	 * advanced last, so a crash can leave an approved ZIP unadvertised but can
+	 * never advertise an absent or unapproved ZIP.
+	 *
+	 * @param \WP_Post $plugin    The plugin post.
+	 * @param array    $candidate The persisted approved candidate.
+	 * @return bool Whether every public pointer was updated.
+	 * @throws Exception When the candidate or release policy no longer matches.
+	 */
+	public static function publish_gandalf_candidate( $plugin, $candidate ) {
+		$current = get_post_meta( $plugin->ID, '_gandalf_release_candidate', true );
+		if (
+			! is_array( $candidate ) ||
+			! is_array( $current ) ||
+			( $candidate['scan_id'] ?? '' ) !== ( $current['scan_id'] ?? '' ) ||
+			'approved' !== ( $current['state'] ?? '' )
+		) {
+			throw new Exception( 'The approved Gandalf candidate is no longer current.' );
+		}
+
+		$release_key = 'trunk' === $candidate['release_ref']
+			? 'trunk@' . $candidate['version']
+			: $candidate['release_ref'];
+		$release     = Plugin_Directory::get_release_by_tag( $plugin, $release_key );
+		if ( ! $release ) {
+			throw new Exception( 'The approved release is missing.' );
+		}
+
+		Plugin_Directory::add_release(
+			$plugin,
+			[
+				'tag'           => $release_key,
+				'release_delay' => 0,
+			]
+		);
+		$release       = Plugin_Directory::get_release_by_tag( $plugin, $release_key );
+		$release_delay = $release['release_delay'] ?? null;
+		if ( 0 !== $release_delay ) {
+			throw new Exception( 'The approved release cooldown could not be cleared.' );
+		}
+
+		if ( 'approved' === $plugin->post_status ) {
+			$plugin->post_status = 'publish';
+			$plugin->post_date   = current_time( 'mysql' );
+			$plugin->post_date_gmt = $plugin->post_date;
+			wp_update_post( $plugin );
+		}
+
+		$old_version      = (string) get_post_meta( $plugin->ID, 'version', true );
+		$old_stable_tag   = (string) get_post_meta( $plugin->ID, 'stable_tag', true );
+		$old_version_date = (string) get_post_meta( $plugin->ID, 'version_date', true );
+		if ( $candidate['version'] !== $old_version ) {
+			update_post_meta( $plugin->ID, 'last_version', wp_slash( $old_version ) );
+			update_post_meta( $plugin->ID, 'last_stable_tag', wp_slash( $old_stable_tag ) );
+			update_post_meta( $plugin->ID, 'last_version_date', wp_slash( $old_version_date ) );
+		}
+		if (
+			$candidate['version'] !== $old_version ||
+			$candidate['release_ref'] !== $old_stable_tag
+		) {
+			update_post_meta( $plugin->ID, 'version_date', wp_slash( current_time( 'mysql' ) ) );
+		}
+
+		update_post_meta( $plugin->ID, 'stable_tag', wp_slash( $candidate['release_ref'] ) );
+		update_post_meta( $plugin->ID, 'version', wp_slash( $candidate['version'] ) );
+		update_post_meta( $plugin->ID, 'tags', wp_slash( $candidate['tags'] ) );
+		update_post_meta( $plugin->ID, 'tagged_versions', wp_slash( array_keys( $candidate['tags'] ) ) );
+		update_post_meta( $plugin->ID, 'last_updated', wp_slash( $candidate['last_updated'] ) );
+
+		Plugin_Directory::mark_zips_built(
+			$plugin,
+			[ $candidate['release_ref'] => $candidate['artifact']['source_revision'] ]
+		);
+
+		if ( ! API_Update_Updater::update_single_plugin( $plugin->post_name ) ) {
+			throw new Exception( 'The approved release could not be written to the update API.' );
+		}
+		Plugins_Info_API::flush_plugin_information_cache( $plugin->post_name );
+
+		do_action(
+			'wporg_plugins_imported',
+			$plugin,
+			$candidate['release_ref'],
+			$old_stable_tag,
+			$candidate['changed_svn_tags'],
+			$candidate['svn_revision'],
+			$candidate['warnings']
+		);
+
+		return true;
+	}
+
+	/**
 	 * (Re)build plugin ZIPs affected by this commit.
 	 *
 	 * @param string $plugin_slug            The plugin slug.
@@ -604,16 +790,36 @@ class Import {
 	 * @param string $current_stable_tag     The current stable tag.
 	 * @param array  $svn_changed_tags       The list of SVN tags modified since last import.
 	 * @param string $svn_revision_triggered The SVN revision which triggered the rebuild.
+	 * @param array  $excluded_versions      Refs whose public ZIPs are awaiting promotion.
 	 *
 	 * @return bool
 	 */
-	protected function rebuild_affected_zips( $plugin_slug, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered = 0 ) {
+	protected function rebuild_affected_zips(
+		$plugin_slug,
+		$stable_tag,
+		$current_stable_tag,
+		$svn_changed_tags,
+		$svn_revision_triggered = 0,
+		$excluded_versions = []
+	) {
 		$versions_to_build = $svn_changed_tags;
+		$normalize_ref     = static function ( $ref ) {
+			return '.' === substr( $ref, 0, 1 ) ? "0{$ref}" : $ref;
+		};
+		$excluded_versions = array_map( $normalize_ref, $excluded_versions );
 
 		// Ensure that the stable zip is built/rebuilt if need be.
 		if ( $stable_tag != $current_stable_tag && ! in_array( $stable_tag, $versions_to_build ) ) {
 			$versions_to_build[] = $stable_tag;
 		}
+		$versions_to_build = array_values(
+			array_filter(
+				$versions_to_build,
+				static function ( $version ) use ( $excluded_versions, $normalize_ref ) {
+					return ! in_array( $normalize_ref( $version ), $excluded_versions, true );
+				}
+			)
+		);
 
 		$plugin = Plugin_Directory::get_plugin_post( $plugin_slug );
 
@@ -826,6 +1032,7 @@ class Import {
 
 			throw new Exception( 'Could not create SVN export: ' . ( $svn_export['errors'] ? implode( ' ', reset( $svn_export['errors'] ) ) : 'Unknown error' ) );
 		}
+		$export_revision = (int) $svn_export['revision'];
 
 		// The readme may not actually exist, but that's okay.
 		$readme = $this->find_readme_file( $tmp_dir . '/export' );
@@ -1113,7 +1320,7 @@ class Import {
 
 		return apply_filters(
 			'wporg_plugins_export_and_parse_plugin',
-			compact( 'readme', 'stable_tag', 'last_modified', 'last_committer', 'last_revision', 'tmp_dir', 'plugin_headers', 'assets', 'tagged_versions', 'blocks', 'block_files', 'dashboard_widgets' ),
+			compact( 'readme', 'stable_tag', 'last_modified', 'last_committer', 'last_revision', 'export_revision', 'tmp_dir', 'plugin_headers', 'assets', 'tagged_versions', 'blocks', 'block_files', 'dashboard_widgets' ),
 			$plugin_slug,
 			$this,
 		);

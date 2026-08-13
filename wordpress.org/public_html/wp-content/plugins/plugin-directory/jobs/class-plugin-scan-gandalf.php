@@ -1,25 +1,30 @@
 <?php
 /**
- * Advisory Gandalf scan integration for plugin updates.
+ * Gandalf publication gate for staged plugin updates.
  *
  * @package WordPressdotorg\Plugin_Directory\Jobs
  */
 
 namespace WordPressdotorg\Plugin_Directory\Jobs;
 
-use WordPressdotorg\Plugin_Directory\Template;
+use WordPressdotorg\Plugin_Directory\CLI\Import;
+use WordPressdotorg\Plugin_Directory\Plugin_Directory;
+use WordPressdotorg\Plugin_Directory\Zip\Builder;
 use WP_Error;
 use WP_Http;
 
 /**
- * Sends plugin updates to Gandalf for advisory security scans.
+ * Scans a staged stable ZIP and publishes only the exact approved bytes.
  *
  * @package WordPressdotorg\Plugin_Directory\Jobs
  */
 class Plugin_Scan_Gandalf {
 
-	/** Pending scans keyed by scan_id, used to recognize callbacks. */
-	const PENDING_META_KEY = '_gandalf_scan_pending';
+	/** The one staged release candidate that may currently be promoted. */
+	const CANDIDATE_META_KEY = '_gandalf_release_candidate';
+
+	/** Callback body hashes keyed by scan ID, used for exact replay handling. */
+	const CONSUMED_META_KEY = '_gandalf_scan_consumed';
 
 	/** Verdict hashes already sent to Slack, to avoid duplicate alerts. */
 	const NOTIFIED_META_KEY = '_gandalf_scan_notified';
@@ -30,65 +35,87 @@ class Plugin_Scan_Gandalf {
 	/** Gandalf scan endpoint. */
 	const ENDPOINT = 'https://gandalf.wordpress.org/scan';
 
+	/** A score at or above this value holds the candidate. */
+	const HOLD_THRESHOLD = 8;
+
 	/**
-	 * Dispatch a Gandalf scan from the importer context carried through cron.
+	 * Dispatch the plugin's authoritative staged release candidate.
 	 *
-	 * @param \WP_Post $plugin         The plugin post.
-	 * @param array    $import_context The importer context.
+	 * @param \WP_Post $plugin  The plugin post.
+	 * @param string   $scan_id The candidate UUIDv4 selected by the cron job.
 	 * @return bool Whether the request was accepted.
+	 * @throws \UnexpectedValueException When the persisted candidate is malformed.
 	 */
-	public static function dispatch_from_import_context( $plugin, $import_context ) {
+	public static function dispatch_candidate( $plugin, $scan_id ) {
 		if ( ! defined( 'WP_GANDALF_SCAN_SHARED_SECRET' ) || ! WP_GANDALF_SCAN_SHARED_SECRET ) {
+			self::record_last_error( $plugin, 'dispatch_not_configured', 'Gandalf shared secret is not configured.', $scan_id );
 			return false;
 		}
 
+		$candidate = get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true );
+		if ( ! is_array( $candidate ) || ( $candidate['scan_id'] ?? '' ) !== $scan_id ) {
+			return true; // The queued candidate was superseded; there is nothing to retry.
+		}
+		if ( 'approved' === ( $candidate['state'] ?? '' ) ) {
+			return true;
+		}
+		if ( ! in_array( $candidate['state'] ?? '', [ 'pending', 'scanning' ], true ) ) {
+			throw new \UnexpectedValueException( 'Gandalf release candidate has an invalid dispatch state.' );
+		}
+
+		$artifact = $candidate['artifact'] ?? null;
 		if (
-			! isset( $import_context['stable_tag'], $import_context['old_stable_tag'], $import_context['changed_svn_tags'] ) ||
-			! is_string( $import_context['stable_tag'] ) ||
-			! is_string( $import_context['old_stable_tag'] ) ||
-			! is_array( $import_context['changed_svn_tags'] )
+			! is_array( $artifact ) ||
+			! wp_is_uuid( $scan_id, 4 ) ||
+			! is_string( $candidate['version'] ?? null ) ||
+			'' === $candidate['version'] ||
+			! is_string( $candidate['release_ref'] ?? null ) ||
+			'' === $candidate['release_ref'] ||
+			! is_string( $artifact['current_zip_url'] ?? null ) ||
+			'' === $artifact['current_zip_url'] ||
+			! preg_match( '/^[a-f0-9]{64}$/', $artifact['current_zip_sha256'] ?? '' ) ||
+			! is_int( $candidate['requested_at'] ?? null ) ||
+			$candidate['requested_at'] < 1
 		) {
-			return false;
+			throw new \UnexpectedValueException( 'Gandalf release candidate is missing required artifact identity.' );
 		}
 
-		$stable_tag       = $import_context['stable_tag'];
-		$old_stable_tag   = $import_context['old_stable_tag'];
-		$changed_svn_tags = array_map( 'strval', $import_context['changed_svn_tags'] );
-		$release_ref      = trim( $stable_tag ) ?: 'trunk';
-
-		// Trunk-only commits should not rescan a tag-based stable ZIP that was not rebuilt.
-		if ( $stable_tag === $old_stable_tag && ! in_array( $release_ref, $changed_svn_tags, true ) ) {
-			return false;
-		}
-
-		// Version is post-import state; without it, the ZIP identity is not reliable.
-		$version = get_post_meta( $plugin->ID, 'version', true );
-		if ( ! $version ) {
-			return false;
-		}
-
-		$previous_release_ref = get_post_meta( $plugin->ID, 'last_stable_tag', true ) ?: null;
-		$previous_version     = get_post_meta( $plugin->ID, 'last_version', true ) ?: null;
-		$previous_zip_url     = null;
-
-		if ( $previous_release_ref && $previous_release_ref !== $release_ref && 'trunk' !== $previous_release_ref ) {
-			$previous_zip_url = Template::download_link( $plugin, $previous_release_ref );
+		$previous = [
+			$candidate['public_version'] ?? null,
+			$candidate['public_release_ref'] ?? null,
+			$candidate['public_zip_url'] ?? null,
+		];
+		$has_previous = array_map(
+			static function ( $value ) {
+				if ( null === $value ) {
+					return false;
+				}
+				if ( ! is_string( $value ) || '' === $value ) {
+					throw new \UnexpectedValueException( 'Gandalf release candidate has invalid public baseline identity.' );
+				}
+				return true;
+			},
+			$previous
+		);
+		if ( count( array_filter( $has_previous ) ) && count( array_filter( $has_previous ) ) !== 3 ) {
+			throw new \UnexpectedValueException( 'Gandalf release candidate has partial public baseline identity.' );
 		}
 
 		return self::dispatch(
 			$plugin,
 			[
-				'scan_id'              => wp_generate_uuid4(),
+				'scan_id'              => $scan_id,
 				'subject_type'         => 'plugin',
 				'slug'                 => $plugin->post_name,
-				'version'              => $version,
-				'release_ref'          => $release_ref,
-				'current_zip_url'      => Template::download_link( $plugin, $release_ref ),
-				'previous_version'     => $previous_zip_url ? $previous_version : null,
-				'previous_release_ref' => $previous_zip_url ? $previous_release_ref : null,
-				'previous_zip_url'     => $previous_zip_url,
+				'version'              => $candidate['version'],
+				'release_ref'          => $candidate['release_ref'],
+				'current_zip_url'      => $artifact['current_zip_url'],
+				'expected_current_zip_sha256' => $artifact['current_zip_sha256'],
+				'previous_version'     => $previous[0],
+				'previous_release_ref' => $previous[1],
+				'previous_zip_url'     => $previous[2],
 				'callback_url'         => rest_url( 'plugins/v1/plugin/' . $plugin->post_name . '/gandalf-scan' ),
-				'requested_at'         => time(),
+				'requested_at'         => (int) $candidate['requested_at'],
 			]
 		);
 	}
@@ -105,19 +132,14 @@ class Plugin_Scan_Gandalf {
 			return false;
 		}
 
-		$pending = get_post_meta( $plugin->ID, self::PENDING_META_KEY, true ) ?: [];
-		foreach ( $pending as $scan_id => $record ) {
-			if ( ! is_array( $record ) || ( $record['requested_at'] ?? 0 ) < time() - DAY_IN_SECONDS ) {
-				unset( $pending[ $scan_id ] );
-			}
+		$candidate = get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true );
+		if (
+			! is_array( $candidate ) ||
+			( $candidate['scan_id'] ?? '' ) !== $request_data['scan_id'] ||
+			! in_array( $candidate['state'] ?? '', [ 'pending', 'scanning' ], true )
+		) {
+			return false;
 		}
-
-		$pending[ $request_data['scan_id'] ] = [
-			'version'      => $request_data['version'],
-			'release_ref'  => $request_data['release_ref'],
-			'requested_at' => $request_data['requested_at'],
-		];
-		update_post_meta( $plugin->ID, self::PENDING_META_KEY, $pending );
 
 		$response = wp_safe_remote_post(
 			self::ENDPOINT,
@@ -143,8 +165,27 @@ class Plugin_Scan_Gandalf {
 		}
 
 		$response_data = json_decode( wp_remote_retrieve_body( $response ), true );
-		if ( ! is_array( $response_data ) || ( $response_data['scan_id'] ?? '' ) !== $request_data['scan_id'] ) {
+		$response_keys = is_array( $response_data ) ? array_keys( $response_data ) : [];
+		sort( $response_keys );
+		if (
+			! is_array( $response_data ) ||
+			[ 'accepted_at', 'scan_id' ] !== $response_keys ||
+			( $response_data['scan_id'] ?? '' ) !== $request_data['scan_id'] ||
+			! is_int( $response_data['accepted_at'] ) ||
+			$response_data['accepted_at'] < 0
+		) {
 			return self::dispatch_failed( $plugin, $request_data, 'Gandalf accepted the scan with an invalid response body.', 'dispatch_ack_invalid' );
+		}
+
+		if ( 'pending' === $candidate['state'] ) {
+			$scanning          = $candidate;
+			$scanning['state'] = 'scanning';
+			if (
+				! update_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $scanning ), $candidate ) &&
+				get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true ) !== $scanning
+			) {
+				return false;
+			}
 		}
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Routed to the error log via E_USER_NOTICE; raw is fine.
@@ -156,34 +197,55 @@ class Plugin_Scan_Gandalf {
 	 * Handle a completed or failed scan callback.
 	 *
 	 * @param \WP_Post $plugin The plugin post.
-	 * @param array    $data   The Gandalf callback data.
+	 * @param array    $data      The Gandalf callback data.
+	 * @param string   $body_hash SHA-256 of the exact callback request body.
 	 * @return true|WP_Error True on success, or an error when the scan is unknown.
+	 * @throws \Throwable When promotion queue rollback fails.
 	 */
-	public static function handle_callback( $plugin, $data ) {
-		$scan_id = $data['scan_id'];
-		$pending = get_post_meta( $plugin->ID, self::PENDING_META_KEY, true ) ?: [];
+	public static function handle_callback( $plugin, $data, $body_hash ) {
+		$scan_id  = $data['scan_id'];
+		$consumed = get_post_meta( $plugin->ID, self::CONSUMED_META_KEY, true ) ?: [];
 
-		if ( empty( $pending[ $scan_id ] ) ) {
+		if ( isset( $consumed[ $scan_id ] ) ) {
+			if ( hash_equals( $consumed[ $scan_id ]['body_hash'] ?? '', $body_hash ) ) {
+				return true;
+			}
+
+			return new WP_Error( 'conflicting_gandalf_callback', 'A different callback was already consumed for this scan_id.', [ 'status' => WP_Http::CONFLICT ] );
+		}
+
+		$candidate = get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true );
+
+		if ( ! is_array( $candidate ) || ( $candidate['scan_id'] ?? '' ) !== $scan_id ) {
 			$error = new WP_Error( 'unknown_gandalf_scan', 'Unknown Gandalf scan_id.', [ 'status' => WP_Http::BAD_REQUEST ] );
 			self::record_invalid_callback( $plugin, $error, $scan_id );
 			return $error;
 		}
 
-		$pending_record = $pending[ $scan_id ];
-
-		if ( $data['version'] !== $pending_record['version'] || $data['release_ref'] !== $pending_record['release_ref'] ) {
+		if ( $data['version'] !== $candidate['version'] || $data['release_ref'] !== $candidate['release_ref'] ) {
 			$error = new WP_Error( 'invalid_gandalf_scan', 'Gandalf callback does not match the pending scan.', [ 'status' => WP_Http::BAD_REQUEST ] );
 			self::record_invalid_callback( $plugin, $error, $scan_id );
 			return $error;
 		}
+		if ( ! in_array( $candidate['state'] ?? '', [ 'pending', 'scanning' ], true ) ) {
+			return new WP_Error( 'gandalf_callback_in_progress', 'This Gandalf callback is already being decided.', [ 'status' => WP_Http::CONFLICT ] );
+		}
+
+		$retryable         = $candidate;
+		$deciding          = $candidate;
+		$deciding['state'] = 'deciding';
+		if ( ! update_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $deciding ), $candidate ) ) {
+			return new WP_Error( 'gandalf_callback_in_progress', 'Another worker is deciding this Gandalf callback.', [ 'status' => WP_Http::CONFLICT ] );
+		}
+		$candidate = $deciding;
 
 		if ( 'completed' === $data['status'] ) {
 			if ( $data['findings_count'] > 0 ) {
 				self::notify_slack(
 					$plugin,
 					[
-						'version'         => $pending_record['version'],
-						'release_ref'     => $pending_record['release_ref'],
+						'version'         => $candidate['version'],
+						'release_ref'     => $candidate['release_ref'],
 						'findings_count'  => $data['findings_count'],
 						'severity_counts' => $data['severity_counts'],
 						'verdict_hash'    => $data['verdict_hash'],
@@ -193,14 +255,108 @@ class Plugin_Scan_Gandalf {
 					]
 				);
 			}
+
+			if ( $data['max_risk_score'] < self::HOLD_THRESHOLD ) {
+				$approved          = $candidate;
+				$approved['state'] = 'approved';
+				if ( ! update_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $approved ), $candidate ) ) {
+					return new WP_Error( 'gandalf_candidate_superseded', 'The release candidate changed while its callback was being decided.', [ 'status' => WP_Http::CONFLICT ] );
+				}
+				try {
+					Plugin_Import::queue( $plugin->post_name, [ 'gandalf_promotion' => $scan_id ] );
+				} catch ( \Throwable $error ) {
+					if (
+						! update_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $retryable ), $approved ) &&
+						get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true ) !== $retryable
+					) {
+						throw $error;
+					}
+					return new WP_Error( 'gandalf_promotion_queue_failed', $error->getMessage(), [ 'status' => WP_Http::INTERNAL_SERVER_ERROR ] );
+				}
+				$outcome = 'approved';
+			} else {
+				$outcome = 'held';
+				delete_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $candidate ) );
+			}
 		} else {
 			self::record_last_error( $plugin, $data['error']['kind'], $data['error']['message'], $scan_id );
+			$outcome = 'failed';
+			delete_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $candidate ) );
 		}
 
-		unset( $pending[ $scan_id ] );
-		update_post_meta( $plugin->ID, self::PENDING_META_KEY, $pending );
+		$consumed[ $scan_id ] = [
+			'body_hash'   => $body_hash,
+			'outcome'     => $outcome,
+			'consumed_at' => time(),
+		];
+		update_post_meta( $plugin->ID, self::CONSUMED_META_KEY, array_slice( $consumed, -100, null, true ) );
 
 		return true;
+	}
+
+	/**
+	 * Promote a previously approved candidate outside the callback request.
+	 *
+	 * @param string $plugin_slug The plugin slug.
+	 * @param string $scan_id     The approved candidate UUIDv4.
+	 * @return true Promotion completed, became inapplicable, or was requeued.
+	 * @throws \RuntimeException When retry scheduling fails.
+	 */
+	public static function cron_promote( $plugin_slug, $scan_id ) {
+		$plugin = Plugin_Directory::get_plugin_post( $plugin_slug );
+		if ( ! $plugin ) {
+			return true;
+		}
+
+		$candidate = get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true );
+		if ( ! is_array( $candidate ) || ( $candidate['scan_id'] ?? '' ) !== $scan_id || 'approved' !== ( $candidate['state'] ?? '' ) ) {
+			return true;
+		}
+
+		try {
+			self::assert_release_may_promote( $plugin, $candidate );
+
+			if ( ! ( new Builder() )->promote( $plugin_slug, $scan_id, $candidate['artifact'], "Gandalf scan {$scan_id}" ) ) {
+				throw new \RuntimeException( 'Plugin ZIP storage is not configured.' );
+			}
+
+			$current = get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true );
+			if ( ! is_array( $current ) || ( $current['scan_id'] ?? '' ) !== $scan_id || 'approved' !== ( $current['state'] ?? '' ) ) {
+				return true;
+			}
+
+			Import::publish_gandalf_candidate( $plugin, $current );
+			delete_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, wp_slash( $current ) );
+			$remaining = get_post_meta( $plugin->ID, self::CANDIDATE_META_KEY, true );
+			if ( is_array( $remaining ) && ( $remaining['scan_id'] ?? '' ) === $scan_id ) {
+				throw new \RuntimeException( 'The promoted Gandalf candidate could not be cleared.' );
+			}
+			return true;
+		} catch ( \Throwable $error ) {
+			self::record_last_error( $plugin, 'promotion_failed', $error->getMessage(), $scan_id );
+			Plugin_Import::queue( $plugin_slug, [ 'gandalf_promotion' => $scan_id ] );
+			return true;
+		}
+	}
+
+	/**
+	 * Assert that the approved release still exists.
+	 *
+	 * @param \WP_Post $plugin    The plugin post.
+	 * @param array    $candidate The approved release candidate.
+	 * @throws \RuntimeException When the exact release is missing.
+	 */
+	protected static function assert_release_may_promote( $plugin, $candidate ) {
+		$release_key = 'trunk' === $candidate['release_ref']
+			? 'trunk@' . $candidate['version']
+			: $candidate['release_ref'];
+
+		$release = Plugin_Directory::get_release_by_tag( $plugin, $release_key );
+		if ( $release ) {
+			return;
+		}
+
+		throw new \RuntimeException( 'The approved release is missing.' );
 	}
 
 	/**
@@ -227,10 +383,6 @@ class Plugin_Scan_Gandalf {
 		$scan_id = sanitize_text_field( $request_data['scan_id'] );
 
 		self::record_last_error( $plugin, $kind, $message, $scan_id );
-
-		$pending = get_post_meta( $plugin->ID, self::PENDING_META_KEY, true ) ?: [];
-		unset( $pending[ $scan_id ] );
-		update_post_meta( $plugin->ID, self::PENDING_META_KEY, $pending );
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Routed to the error log via E_USER_NOTICE; raw is fine.
 		trigger_error( sprintf( 'Failed to dispatch Gandalf scan for %s: %s', $plugin->post_name, $message ), E_USER_NOTICE );

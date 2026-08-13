@@ -1688,18 +1688,43 @@ class Plugin_Directory {
 	 * @return array|bool
 	 */
 	public static function get_release( $plugin, $tag ) {
-		$releases = self::get_releases( $plugin );
-
 		// Look for the version released as a tag.
-		$filtered = wp_list_filter( $releases, compact( 'tag' ) );
+		$release = self::get_release_by_tag( $plugin, $tag );
+		if ( $release ) {
+			return $release;
+		}
+
+		// Look for the tag as a trunk version.
+		$filtered = wp_list_filter(
+			self::get_releases( $plugin ),
+			[
+				'tag'     => "trunk@{$tag}",
+				'version' => $tag,
+			]
+		);
 		if ( $filtered ) {
 			return array_shift( $filtered );
 		}
 
-		// Look for the tag as a trunk version.
-		$filtered = wp_list_filter( $releases, [ 'tag' => "trunk@{$tag}", 'version' => $tag ] );
-		if ( $filtered ) {
-			return array_shift( $filtered );
+		return false;
+	}
+
+	/**
+	 * Fetch the release stored under one exact tag, without trunk fallback.
+	 *
+	 * Release-policy writes use this method because a physical tag and a
+	 * same-Version trunk release are different distribution artifacts.
+	 *
+	 * @param string|\WP_Post $plugin Plugin slug or post object.
+	 * @param string          $tag    Exact stored release tag.
+	 * @return array|false The exact release, or false when absent.
+	 */
+	public static function get_release_by_tag( $plugin, $tag ) {
+		$tag = (string) $tag;
+		foreach ( self::get_releases( $plugin ) as $release ) {
+			if ( ( $release['tag'] ?? null ) === $tag ) {
+				return $release;
+			}
 		}
 
 		return false;
@@ -1720,9 +1745,17 @@ class Plugin_Directory {
 		// PHP coerces numeric-string array keys to integers; release tags are strings.
 		$data['tag'] = (string) $data['tag'];
 
-		$plugin = self::get_plugin_post( $plugin );
+		$plugin   = self::get_plugin_post( $plugin );
+		$releases = self::get_releases( $plugin );
+		$release  = false;
+		foreach ( $releases as $stored_release ) {
+			if ( $stored_release['tag'] === $data['tag'] ) {
+				$release = $stored_release;
+				break;
+			}
+		}
 
-		$release = self::get_release( $plugin, $data['tag'] ) ?: [
+		$release = $release ?: [
 			'date'                     => time(),
 			'tag'                      => '',
 			'version'                  => '',
@@ -1757,17 +1790,6 @@ class Plugin_Directory {
 		if ( isset( $data['undo-discard'] ) && ! empty( $release['discarded'] ) && empty( $data['discarded'] ) ) {
 			unset( $release['discarded'] );
 		}
-
-		/*
-		 * Clear a release block so the release can be served.
-		 * See Jobs\API_Update_Updater::force_release().
-		 */
-		if ( ! empty( $data['unblock'] ) ) {
-			unset( $release['release_block'] );
-		}
-		unset( $release['unblock'] );
-
-		$releases = self::get_releases( $plugin );
 
 		// Find any other releases using this slug (as in the case of updates) and remove it.
 		// Only one release can exist in any given tag.

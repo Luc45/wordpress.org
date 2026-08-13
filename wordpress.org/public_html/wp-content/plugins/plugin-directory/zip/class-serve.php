@@ -13,6 +13,34 @@ use Exception;
  */
 class Serve {
 
+	/** UUIDv4 shape used by staged Gandalf ZIP capabilities. */
+	private const UUID_V4_PATTERN = '[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}';
+
+	/**
+	 * Build the capability URL for a staged ZIP.
+	 *
+	 * @param string $slug    The plugin slug.
+	 * @param string $scan_id The Gandalf scan UUIDv4.
+	 * @return string The signed staged ZIP URL.
+	 * @throws Exception When the inputs or shared secret are invalid.
+	 */
+	public static function staged_download_url( $slug, $scan_id ) {
+		if (
+			! is_string( $slug ) ||
+			! is_string( $scan_id ) ||
+			! preg_match( '/^[a-z0-9-_]+$/', $slug ) ||
+			! preg_match( '/^' . self::UUID_V4_PATTERN . '$/', $scan_id ) ||
+			! defined( 'WP_GANDALF_SCAN_SHARED_SECRET' ) ||
+			'' === (string) WP_GANDALF_SCAN_SHARED_SECRET
+		) {
+			throw new Exception( __METHOD__ . ': Invalid staged ZIP capability.' );
+		}
+
+		$signature = hash_hmac( 'sha256', "{$slug}:{$scan_id}", (string) WP_GANDALF_SCAN_SHARED_SECRET );
+
+		return "https://downloads.wordpress.org/plugin/{$slug}.gandalf-{$scan_id}-{$signature}.zip";
+	}
+
 	public function __construct() {
 		try {
 			$request = $this->determine_request();
@@ -58,6 +86,37 @@ class Serve {
 			$version = $m['version'];
 		}
 
+		$version = rawurldecode( $version );
+		if ( str_contains( $version, '%' ) || str_contains( $version, '/' ) || str_contains( $version, '\\' ) ) {
+			throw new Exception( __METHOD__ . ': Invalid URL.' );
+		}
+
+		$is_staged = str_starts_with( $version, 'gandalf-' );
+		if ( $is_staged ) {
+			$valid_stage = ! $checksum_request && ! $signature_request &&
+				defined( 'WP_GANDALF_SCAN_SHARED_SECRET' ) &&
+				'' !== (string) WP_GANDALF_SCAN_SHARED_SECRET &&
+				preg_match(
+					'/^gandalf-(?P<scan_id>' . self::UUID_V4_PATTERN . ')-(?P<signature>[a-f0-9]{64})$/',
+					$version,
+					$staged
+				) &&
+				hash_equals(
+					hash_hmac( 'sha256', "{$slug}:{$staged['scan_id']}", (string) WP_GANDALF_SCAN_SHARED_SECRET ),
+					$staged['signature']
+				);
+
+			if (
+				! $valid_stage ||
+				$staged['scan_id'] !== $this->get_staged_candidate_scan_id( $slug )
+			) {
+				throw new Exception( __METHOD__ . ': Invalid staged ZIP capability.' );
+			}
+
+			// The signature authorizes access but is never part of the stored filename.
+			$version = 'gandalf-' . $staged['scan_id'];
+		}
+
 		// If the latest-stable is requested, determine the file to serve.
 		$is_latest_stable = ( 'latest-stable' == $version );
 		if ( $is_latest_stable ) {
@@ -73,7 +132,7 @@ class Serve {
 			'stats' => true,
 		);
 
-		if ( $checksum_request || $signature_request ) {
+		if ( $checksum_request || $signature_request || $is_staged ) {
 			$args['stats'] = false;
 
 		} elseif ( isset( $_GET['stats'] ) ) {
@@ -84,7 +143,7 @@ class Serve {
 		}
 
 
-		return compact( 'zip', 'slug', 'version', 'args', 'checksum_request', 'signature_request', 'is_latest_stable' );
+		return compact( 'zip', 'slug', 'version', 'args', 'checksum_request', 'signature_request', 'is_latest_stable', 'is_staged' );
 	}
 
 	/**
@@ -145,6 +204,41 @@ class Serve {
 	}
 
 	/**
+	 * Retrieve the current staged Gandalf candidate's scan ID.
+	 *
+	 * @param string $plugin_slug The plugin slug.
+	 * @return string The current scan ID, or an empty string if none is staged.
+	 */
+	protected function get_staged_candidate_scan_id( $plugin_slug ) {
+		global $wpdb;
+
+		$post_id = $this->get_post_id( $plugin_slug );
+		$meta    = wp_cache_get( $post_id, 'post_meta' );
+
+		$candidate = false;
+		if ( isset( $meta['_gandalf_release_candidate'][0] ) ) {
+			$candidate = maybe_unserialize( $meta['_gandalf_release_candidate'][0] );
+		}
+
+		if ( ! is_array( $candidate ) ) {
+			$candidate = maybe_unserialize(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT meta_value FROM $wpdb->postmeta WHERE post_id = %d AND meta_key = '_gandalf_release_candidate' LIMIT 1",
+						$post_id
+					)
+				)
+			);
+		}
+
+		return is_array( $candidate ) &&
+			in_array( $candidate['state'] ?? '', array( 'pending', 'scanning' ), true ) &&
+			is_string( $candidate['scan_id'] ?? null )
+			? $candidate['scan_id']
+			: '';
+	}
+
+	/**
 	 * Retrieve the post_id for a Plugin slug.
 	 *
 	 * This function uses the Object Cache and $wpdb directly to avoid
@@ -202,6 +296,10 @@ class Serve {
 	 */
 	protected function serve_zip( $request ) {
 		$file = $this->get_file( $request );
+
+		if ( $request['is_staged'] ) {
+			header( 'Cache-Control: private, no-store' );
+		}
 
 		if ( defined( 'PLUGIN_ZIP_X_ACCEL_REDIRECT_LOCATION' ) ) {
 			$file_url = PLUGIN_ZIP_X_ACCEL_REDIRECT_LOCATION . $file;
