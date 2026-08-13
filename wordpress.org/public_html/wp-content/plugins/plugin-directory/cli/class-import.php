@@ -562,12 +562,14 @@ class Import {
 		$this->rebuild_affected_zips( $plugin_slug, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered );
 
 		// If we've got a new version, store the last version in the plugin meta.
-		if ( $version && $version !== $plugin->version ) {
+		if ( '' !== $version && $version !== $plugin->version ) {
 			update_post_meta( $plugin->ID, 'last_version', wp_slash( $plugin->version ) );
 			update_post_meta( $plugin->ID, 'last_stable_tag', wp_slash( $current_stable_tag ) );
 			update_post_meta( $plugin->ID, 'last_version_date', wp_slash( $plugin->version_date ) );
 
 			// Keep the date of the last version change, this often differs from the last_updated/post_modified dates.
+			update_post_meta( $plugin->ID, 'version_date', wp_slash( current_time( 'mysql' ) ) );
+		} elseif ( '' !== $version && $stable_tag !== $current_stable_tag ) {
 			update_post_meta( $plugin->ID, 'version_date', wp_slash( current_time( 'mysql' ) ) );
 		}
 
@@ -590,8 +592,9 @@ class Import {
 		 * @param array   $changed_tags   The list of SVN tags/trunk affected to trigger the import.
 		 * @param int     $svn_revision   The SVN revision that triggered the import.
 		 * @param array   $warnings       The list of warnings generated during the import process.
+		 * @param string  $version        The imported plugin Version header.
 		 */
-		do_action( 'wporg_plugins_imported', $plugin, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered, $this->warnings );
+		do_action( 'wporg_plugins_imported', $plugin, $stable_tag, $current_stable_tag, $svn_changed_tags, $svn_revision_triggered, $this->warnings, $version );
 
 		return true;
 	}

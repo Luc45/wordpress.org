@@ -217,6 +217,15 @@ class Gandalf_Scan extends Base {
 			return $error;
 		}
 
+		if (
+			'completed' === $data['status'] &&
+			( ! isset( $data['max_risk_score'] ) || $data['max_risk_score'] < 0 || $data['max_risk_score'] > 10 )
+		) {
+			$error = new WP_Error( 'invalid_gandalf_scan', 'Security scan callback has an invalid maximum risk score.', [ 'status' => WP_Http::BAD_REQUEST ] );
+			Plugin_Scan_Gandalf::record_invalid_callback( $plugin, $error, $data['scan_id'] );
+			return $error;
+		}
+
 		$result = Plugin_Scan_Gandalf::handle_callback( $plugin, $data );
 		if ( is_wp_error( $result ) ) {
 			return $result;

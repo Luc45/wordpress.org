@@ -1,6 +1,6 @@
 <?php
 /**
- * Tests for update_source writes while a version is held by a cooldown or block.
+ * Tests for update_source writes while a release is held by a cooldown or block.
  *
  * @package WordPressdotorg\Plugin_Directory\Tests
  */
@@ -14,7 +14,7 @@ use WordPressdotorg\Plugin_Directory\Plugin_Directory;
 
 /**
  * Tests that a hold — a release cooldown or a release block — defers only the
- * version bump, while status changes reach the `update_source` row immediately.
+ * release change, while status changes reach the `update_source` row immediately.
  * A cooldown expires on its own; a block lasts until the release is force-released.
  *
  * @group jobs
@@ -129,7 +129,7 @@ class Update_Source_Hold_Test extends TestCase {
 
 		return $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT available, version, meta FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s",
+				"SELECT available, version, stable_tag, meta FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s",
 				$this->plugin->post_name
 			)
 		);
@@ -165,6 +165,8 @@ class Update_Source_Hold_Test extends TestCase {
 	private function block(): bool {
 		return API_Update_Updater::block_release(
 			$this->plugin->post_name,
+			self::STAGED_VERSION,
+			self::STAGED_VERSION,
 			array( 'reason' => 'High-risk release.' )
 		);
 	}
@@ -210,6 +212,51 @@ class Update_Source_Hold_Test extends TestCase {
 	}
 
 	/**
+	 * Legacy trunk releases without release metadata still reach the update API.
+	 */
+	public function test_missing_release_metadata_remains_supported(): void {
+		update_post_meta( $this->plugin->ID, 'stable_tag', 'trunk' );
+		update_post_meta( $this->plugin->ID, 'releases', array() );
+
+		$this->assertTrue( API_Update_Updater::update_single_plugin( $this->plugin->post_name ) );
+		$this->assertSame( self::STAGED_VERSION, $this->get_row()->version );
+	}
+
+	/**
+	 * A new tag gets a fresh hold window even when its Version is unchanged.
+	 */
+	public function test_same_version_new_tag_is_deferred(): void {
+		global $wpdb;
+		update_post_meta( $this->plugin->ID, 'version_date', current_time( 'mysql' ) );
+		$this->insert_served_row( self::STAGED_VERSION );
+		$wpdb->update(
+			$wpdb->prefix . 'update_source',
+			array( 'stable_tag' => 'old-tag' ),
+			array( 'plugin_slug' => $this->plugin->post_name )
+		);
+
+		$this->assertTrue( API_Update_Updater::update_single_plugin( $this->plugin->post_name ) );
+		$this->assertSame( 'old-tag', $this->get_row()->stable_tag );
+		$this->assertNotFalse( wp_next_scheduled( "release_to_update_api:{$this->plugin->post_name}" ) );
+
+		update_post_meta( $this->plugin->ID, 'version_date', gmdate( 'Y-m-d H:i:s', time() - 2 * DAY_IN_SECONDS ) );
+		$this->assertTrue( API_Update_Updater::update_single_plugin( $this->plugin->post_name ) );
+		$this->assertSame( self::STAGED_VERSION, $this->get_row()->stable_tag );
+	}
+
+	/**
+	 * A tagged ref never falls back to a same-version trunk release.
+	 */
+	public function test_block_does_not_fall_back_to_trunk(): void {
+		$release        = $this->get_release();
+		$release['tag'] = 'trunk@' . self::STAGED_VERSION;
+		update_post_meta( $this->plugin->ID, 'releases', array( $release ) );
+
+		$this->assertFalse( $this->block() );
+		$this->assertFalse( API_Update_Updater::is_release_blocked( Plugin_Directory::get_release( $this->plugin, self::STAGED_VERSION ) ) );
+	}
+
+	/**
 	 * Closing a plugin mid-cooldown withdraws its row immediately, still on
 	 * the served version.
 	 */
@@ -243,7 +290,7 @@ class Update_Source_Hold_Test extends TestCase {
 
 	/**
 	 * Reopening a closed plugin mid-cooldown restores its row immediately;
-	 * only the version bump keeps waiting for the cooldown.
+	 * only the release change keeps waiting for the cooldown.
 	 */
 	public function test_reopen_during_cooldown_restores_row(): void {
 		$this->insert_served_row();
@@ -338,31 +385,14 @@ class Update_Source_Hold_Test extends TestCase {
 	}
 
 	/**
-	 * A version that is already being served cannot be blocked.
+	 * A served release is burned without being removed from the update API.
 	 */
-	public function test_served_version_is_not_blockable(): void {
+	public function test_served_version_is_burned_without_unshipping(): void {
 		$this->insert_served_row( self::STAGED_VERSION );
 
-		$this->assertFalse( $this->block() );
-		$this->assertFalse( API_Update_Updater::is_release_blocked( $this->get_release() ) );
-	}
-
-	/**
-	 * A served version longer than the row's varchar(128) `version` column is
-	 * stored truncated; the truncated match still counts as already live.
-	 */
-	public function test_served_truncated_version_is_not_blockable(): void {
-		$long_version = str_repeat( '1.0.', 50 ) . '0';
-
-		$release            = $this->get_release();
-		$release['tag']     = $long_version;
-		$release['version'] = $long_version;
-
-		update_post_meta( $this->plugin->ID, 'version', $long_version );
-		update_post_meta( $this->plugin->ID, 'releases', array( $release ) );
-		$this->insert_served_row( substr( $long_version, 0, 128 ) );
-
-		$this->assertFalse( $this->block() );
+		$this->assertTrue( $this->block() );
+		$this->assertTrue( API_Update_Updater::is_release_blocked( $this->get_release() ) );
+		$this->assertSame( self::STAGED_VERSION, $this->get_row()->version );
 	}
 
 	/**
@@ -378,6 +408,7 @@ class Update_Source_Hold_Test extends TestCase {
 		$release['version'] = $long_version;
 
 		update_post_meta( $this->plugin->ID, 'version', $long_version );
+		update_post_meta( $this->plugin->ID, 'stable_tag', $long_version );
 		update_post_meta( $this->plugin->ID, 'releases', array( $release ) );
 		$this->insert_served_row( substr( $long_version, 0, 128 ) );
 
@@ -408,6 +439,8 @@ class Update_Source_Hold_Test extends TestCase {
 
 		$second = API_Update_Updater::block_release(
 			$this->plugin->post_name,
+			self::STAGED_VERSION,
+			self::STAGED_VERSION,
 			array( 'reason' => 'Another reason.' )
 		);
 

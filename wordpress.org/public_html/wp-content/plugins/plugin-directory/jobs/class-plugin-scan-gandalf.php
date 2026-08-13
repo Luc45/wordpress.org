@@ -1,6 +1,6 @@
 <?php
 /**
- * Advisory Gandalf scan integration for plugin updates.
+ * Gandalf scan integration for plugin updates.
  *
  * @package WordPressdotorg\Plugin_Directory\Jobs
  */
@@ -12,7 +12,7 @@ use WP_Error;
 use WP_Http;
 
 /**
- * Sends plugin updates to Gandalf for advisory security scans.
+ * Sends plugin updates to Gandalf and applies release policy to their results.
  *
  * @package WordPressdotorg\Plugin_Directory\Jobs
  */
@@ -26,6 +26,9 @@ class Plugin_Scan_Gandalf {
 
 	/** Last dispatch or callback error for quick operator debugging. */
 	const LAST_ERROR_META_KEY = '_gandalf_scan_last_error';
+
+	/** Completed scans at or above this score burn their release ref. */
+	const BLOCK_RISK_SCORE = 8.0;
 
 	/** Gandalf scan endpoint. */
 	const ENDPOINT = 'https://gandalf.wordpress.org/scan';
@@ -43,36 +46,53 @@ class Plugin_Scan_Gandalf {
 		}
 
 		if (
-			! isset( $import_context['stable_tag'], $import_context['old_stable_tag'], $import_context['changed_svn_tags'] ) ||
+			! isset( $import_context['stable_tag'], $import_context['old_stable_tag'], $import_context['changed_svn_tags'], $import_context['version'], $import_context['served_release'] ) ||
 			! is_string( $import_context['stable_tag'] ) ||
+			'' === $import_context['stable_tag'] ||
 			! is_string( $import_context['old_stable_tag'] ) ||
-			! is_array( $import_context['changed_svn_tags'] )
+			! is_array( $import_context['changed_svn_tags'] ) ||
+			! is_string( $import_context['version'] ) ||
+			'' === $import_context['version'] ||
+			( false !== $import_context['served_release'] && ! is_array( $import_context['served_release'] ) )
 		) {
-			return false;
+			throw new \UnexpectedValueException( 'Invalid Gandalf import context.' );
 		}
 
 		$stable_tag       = $import_context['stable_tag'];
 		$old_stable_tag   = $import_context['old_stable_tag'];
 		$changed_svn_tags = array_map( 'strval', $import_context['changed_svn_tags'] );
-		$release_ref      = trim( $stable_tag ) ?: 'trunk';
+		$release_ref      = $stable_tag;
 
 		// Trunk-only commits should not rescan a tag-based stable ZIP that was not rebuilt.
 		if ( $stable_tag === $old_stable_tag && ! in_array( $release_ref, $changed_svn_tags, true ) ) {
 			return false;
 		}
 
-		// Version is post-import state; without it, the ZIP identity is not reliable.
-		$version = get_post_meta( $plugin->ID, 'version', true );
-		if ( ! $version ) {
-			return false;
-		}
-
-		$previous_release_ref = get_post_meta( $plugin->ID, 'last_stable_tag', true ) ?: null;
-		$previous_version     = get_post_meta( $plugin->ID, 'last_version', true ) ?: null;
+		$version              = $import_context['version'];
+		$served_release       = $import_context['served_release'];
+		$previous_release_ref = null;
+		$previous_version     = null;
 		$previous_zip_url     = null;
 
-		if ( $previous_release_ref && $previous_release_ref !== $release_ref && 'trunk' !== $previous_release_ref ) {
-			$previous_zip_url = Template::download_link( $plugin, $previous_release_ref );
+		if ( false !== $served_release ) {
+			if (
+				! isset( $served_release['version'], $served_release['stable_tag'] ) ||
+				! is_string( $served_release['version'] ) ||
+				'' === $served_release['version'] ||
+				! is_string( $served_release['stable_tag'] ) ||
+				'' === $served_release['stable_tag']
+			) {
+				throw new \UnexpectedValueException( 'Invalid served release identity.' );
+			}
+
+			if ( 'trunk' !== $served_release['stable_tag'] && $served_release['stable_tag'] !== $release_ref ) {
+				$release = API_Update_Updater::get_release_by_ref( $plugin, $served_release['version'], $served_release['stable_tag'] );
+				if ( $release && $release['version'] === $served_release['version'] && ! API_Update_Updater::is_release_blocked( $release ) ) {
+					$previous_version     = $served_release['version'];
+					$previous_release_ref = $served_release['stable_tag'];
+					$previous_zip_url     = Template::download_link( $plugin, $previous_release_ref );
+				}
+			}
 		}
 
 		return self::dispatch(
@@ -84,8 +104,8 @@ class Plugin_Scan_Gandalf {
 				'version'              => $version,
 				'release_ref'          => $release_ref,
 				'current_zip_url'      => Template::download_link( $plugin, $release_ref ),
-				'previous_version'     => $previous_zip_url ? $previous_version : null,
-				'previous_release_ref' => $previous_zip_url ? $previous_release_ref : null,
+				'previous_version'     => $previous_version,
+				'previous_release_ref' => $previous_release_ref,
 				'previous_zip_url'     => $previous_zip_url,
 				'callback_url'         => rest_url( 'plugins/v1/plugin/' . $plugin->post_name . '/gandalf-scan' ),
 				'requested_at'         => time(),
@@ -178,6 +198,23 @@ class Plugin_Scan_Gandalf {
 		}
 
 		if ( 'completed' === $data['status'] ) {
+			if (
+				$data['max_risk_score'] >= self::BLOCK_RISK_SCORE &&
+				! API_Update_Updater::block_release(
+					$plugin->post_name,
+					$pending_record['version'],
+					$pending_record['release_ref'],
+					array(
+						'scan_id'    => $scan_id,
+						'risk_score' => $data['max_risk_score'],
+					)
+				)
+			) {
+				$error = new WP_Error( 'security_scan_block_failed', 'The scanned release could not be blocked.', [ 'status' => WP_Http::INTERNAL_SERVER_ERROR ] );
+				self::record_invalid_callback( $plugin, $error, $scan_id );
+				return $error;
+			}
+
 			if ( $data['findings_count'] > 0 ) {
 				self::notify_slack(
 					$plugin,
@@ -189,7 +226,7 @@ class Plugin_Scan_Gandalf {
 						'verdict_hash'    => $data['verdict_hash'],
 						'report_url'      => $data['report_url'],
 						'findings'        => is_array( $data['findings'] ?? null ) ? array_filter( $data['findings'], 'is_array' ) : [],
-						'max_risk_score'  => $data['max_risk_score'] ?? null,
+						'max_risk_score'  => $data['max_risk_score'],
 					]
 				);
 			}

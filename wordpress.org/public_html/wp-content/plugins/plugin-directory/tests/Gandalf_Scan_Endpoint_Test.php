@@ -9,6 +9,7 @@ declare( strict_types = 1 );
 
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use WordPressdotorg\Plugin_Directory\Jobs\API_Update_Updater;
 use WordPressdotorg\Plugin_Directory\Jobs\Plugin_Scan_Gandalf;
 use WordPressdotorg\Plugin_Directory\Plugin_Directory;
 
@@ -84,6 +85,8 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 		update_post_meta( $this->plugin->ID, 'version', self::VERSION );
 		update_post_meta( $this->plugin->ID, 'stable_tag', self::VERSION );
+		update_post_meta( $this->plugin->ID, 'releases', array() );
+		$this->add_release( self::VERSION, self::VERSION );
 		update_post_meta(
 			$this->plugin->ID,
 			Plugin_Scan_Gandalf::PENDING_META_KEY,
@@ -93,6 +96,25 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 					'release_ref'  => self::VERSION,
 					'requested_at' => time(),
 				),
+			)
+		);
+	}
+
+	/**
+	 * Add a release fixture.
+	 *
+	 * @param string $tag     The release tag.
+	 * @param string $version The Version header.
+	 */
+	private function add_release( string $tag, string $version ): void {
+		$this->assertTrue(
+			Plugin_Directory::add_release(
+				$this->plugin,
+				array(
+					'tag'           => $tag,
+					'version'       => $version,
+					'release_delay' => DAY_IN_SECONDS,
+				)
 			)
 		);
 	}
@@ -209,6 +231,111 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 		$this->assertSame( array( 'success' => true ), $response->get_data() );
 
 		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+		$this->assertFalse( API_Update_Updater::is_release_blocked( Plugin_Directory::get_release( $this->plugin, self::VERSION ) ) );
+	}
+
+	/**
+	 * Delayed dispatch and callback use the queued identities, not later plugin state.
+	 */
+	public function test_delayed_scan_burns_its_frozen_ref(): void {
+		$this->add_release( 'served-tag', '2.6.0' );
+		$this->add_release( 'candidate-tag', self::VERSION );
+
+		global $wpdb;
+		$wpdb->insert(
+			$wpdb->prefix . 'update_source',
+			array(
+				'plugin_id'        => $this->plugin->ID,
+				'plugin_slug'      => $this->plugin->post_name,
+				'available'        => 1,
+				'version'          => '2.6.0',
+				'stable_tag'       => 'served-tag',
+				'plugin_name'      => $this->plugin->post_title,
+				'requires_plugins' => '',
+				'last_updated'     => $this->plugin->post_modified,
+			)
+		);
+
+		$context         = null;
+		$schedule_filter = static function ( $pre, $event ) use ( &$context ) {
+			$context = $event->args[2];
+			return false;
+		};
+		add_filter( 'pre_schedule_event', $schedule_filter, 10, 2 );
+		try {
+			do_action( 'wporg_plugins_imported', $this->plugin, 'candidate-tag', 'served-tag', array( 'candidate-tag' ), 123, array(), self::VERSION );
+		} finally {
+			remove_filter( 'pre_schedule_event', $schedule_filter );
+		}
+		$this->assertIsArray( $context );
+
+		$this->add_release( 'candidate-tag', '2.8.0' );
+		$this->add_release( 'new-tag', '2.8.0' );
+		update_post_meta( $this->plugin->ID, 'version', '2.8.0' );
+		update_post_meta( $this->plugin->ID, 'stable_tag', 'new-tag' );
+		$wpdb->update(
+			$wpdb->prefix . 'update_source',
+			array(
+				'version'    => '2.8.0',
+				'stable_tag' => 'new-tag',
+			),
+			array( 'plugin_slug' => $this->plugin->post_name )
+		);
+
+		$body        = null;
+		$http_filter = static function ( $pre, $args ) use ( &$body ) {
+			$body = json_decode( $args['body'], true );
+			return array(
+				'body'     => wp_json_encode( array( 'scan_id' => $body['scan_id'] ) ),
+				'response' => array( 'code' => 202 ),
+			);
+		};
+		add_filter( 'pre_http_request', $http_filter, 10, 2 );
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_set_error_handler -- Intercepts the expected dispatch notice.
+		set_error_handler( static fn( $level ) => E_USER_NOTICE === $level );
+		try {
+			$this->assertTrue( Plugin_Scan_Gandalf::dispatch_from_import_context( $this->plugin, $context ) );
+		} finally {
+			restore_error_handler();
+			remove_filter( 'pre_http_request', $http_filter );
+		}
+
+		$this->assertSame( self::VERSION, $body['version'] );
+		$this->assertSame( 'candidate-tag', $body['release_ref'] );
+		$this->assertStringEndsWith( '.candidate-tag.zip', $body['current_zip_url'] );
+		$this->assertSame( '2.6.0', $body['previous_version'] );
+		$this->assertSame( 'served-tag', $body['previous_release_ref'] );
+		$this->assertStringEndsWith( '.served-tag.zip', $body['previous_zip_url'] );
+
+		$response = $this->dispatch(
+			$this->payload(
+				array(
+					'scan_id'        => $body['scan_id'],
+					'version'        => self::VERSION,
+					'release_ref'    => 'candidate-tag',
+					'max_risk_score' => 8.0,
+				)
+			)
+		);
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertTrue( API_Update_Updater::is_release_blocked( Plugin_Directory::get_release( $this->plugin, 'candidate-tag' ) ) );
+		$this->assertFalse( API_Update_Updater::is_release_blocked( Plugin_Directory::get_release( $this->plugin, 'new-tag' ) ) );
+
+		update_post_meta( $this->plugin->ID, 'stable_tag', 'candidate-tag' );
+		$this->assertTrue( API_Update_Updater::update_single_plugin( $this->plugin->post_name ) );
+		$this->assertSame( 'new-tag', $wpdb->get_var( $wpdb->prepare( "SELECT stable_tag FROM {$wpdb->prefix}update_source WHERE plugin_slug = %s", $this->plugin->post_name ) ) );
+	}
+
+	/**
+	 * A block failure is retryable and does not consume the pending scan.
+	 */
+	public function test_block_failure_keeps_scan_pending(): void {
+		update_post_meta( $this->plugin->ID, 'releases', array() );
+
+		$response = $this->dispatch( $this->payload( array( 'max_risk_score' => 8.0 ) ) );
+
+		$this->assertSame( 500, $response->get_status() );
+		$this->assertArrayHasKey( self::SCAN_ID, get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
 	}
 
 	/**
@@ -241,13 +368,13 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 	/**
 	 * Contract additions the directory does not know yet — new fields at any
-	 * level, a new severity, a recalibrated score — do not void a delivery.
+	 * level and a new severity do not void a delivery.
 	 */
 	public function test_unknown_contract_additions_are_accepted(): void {
 		$payload = $this->payload(
 			array(
 				'scan_duration'  => 314,
-				'max_risk_score' => 10.5,
+				'max_risk_score' => 9.5,
 			)
 		);
 
@@ -259,6 +386,16 @@ class Gandalf_Scan_Endpoint_Test extends TestCase {
 
 		$this->assertSame( 200, $response->get_status() );
 		$this->assertEmpty( get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
+	}
+
+	/**
+	 * Automatic policy rejects an out-of-range score.
+	 */
+	public function test_out_of_range_policy_score_is_rejected(): void {
+		$response = $this->dispatch( $this->payload( array( 'max_risk_score' => 10.5 ) ) );
+
+		$this->assertSame( 400, $response->get_status() );
+		$this->assertArrayHasKey( self::SCAN_ID, get_post_meta( $this->plugin->ID, Plugin_Scan_Gandalf::PENDING_META_KEY, true ) );
 	}
 
 	/**
